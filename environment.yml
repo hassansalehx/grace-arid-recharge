@@ -1,0 +1,33 @@
+name: grace-arid
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10,<3.13
+  - numpy
+  - scipy
+  - pandas
+  - xarray
+  - dask
+  - distributed
+  - netcdf4
+  - h5netcdf
+  - zarr
+  - rioxarray
+  - rasterio
+  - geopandas
+  - shapely
+  - pyproj
+  - matplotlib
+  - cartopy
+  - seaborn
+  - tqdm
+  - joblib
+  - statsmodels
+  - scikit-learn
+  - requests
+  - jupyter
+  - ipykernel
+  - earthaccess
+  - pip
+  - pip:
+      - pympler

@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the manuscript and this repository."
+title: "GRACE arid-region extreme precipitation recharge analysis"
+authors:
+  - family-names: Saleh
+    given-names: Hassan
+    affiliation: Western Michigan University
+  - family-names: Sultan
+    given-names: Mohamed
+    affiliation: Western Michigan University
+version: 0.1.0
+date-released: "2026-07-17"
+license: MIT
+repository-code: "https://github.com/PLACEHOLDER/grace-arid-recharge"
+keywords:
+  - GRACE
+  - groundwater
+  - arid regions
+  - extreme precipitation
+  - recharge efficiency
+abstract: >
+  Analysis code and workflows for a global, event-based assessment of aquifer
+  response to extreme precipitation in arid regions using GRACE/GRACE-FO,
+  IMERG precipitation, GLDAS land-surface models, and in-situ well observations.

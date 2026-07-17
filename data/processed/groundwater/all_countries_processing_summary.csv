@@ -1,0 +1,9 @@
+Country,Folder_Name,Wells_with_Valid_Coordinates,Monitoring_Files_Found,Monitoring_Files_Matched,Files_Successfully_Processed,Final_Wells_Count,Wells_with_Elevation_Data,Units_Used,Parameter_Types,Status
+AUS,AUS - GGMN,24882,21476,21476,21476,21476,0,m:21476,Water depth [from the ground surface]:21476,Success
+CHL,CHL - GGMN,1169,1169,1169,1169,1169,1169,m:1169,Water depth [from the ground surface]:1169,Success
+JOR,JOR - GGMN,125,125,125,125,125,118,m:125,Water depth [from the ground surface]:125,Success
+MEX,MEX - GGMN,14524,14524,14524,14524,14524,14524,m:14524,Water depth [from the ground surface]:14524,Success
+NAM,NAM - GGMN,84,84,84,84,84,84,m:84,"Water depth [from the ground surface]:74, Water level elevation a.m.s.l.:10",Success
+UGA,UGA - GGMN,10,10,10,10,10,10,m:10,Water level elevation a.m.s.l.:10,Success
+USA,USA - GGMN,12856,13037,12600,12600,12600,12529,m:12600,Water depth [from the ground surface]:12600,Success
+ZAF,ZAF - GGMN,3539,3537,3537,3537,3537,3537,m:3537,Water depth [from the ground surface]:3537,Success
