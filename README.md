@@ -12,7 +12,7 @@ The workflow uses GRACE/GRACE-FO terrestrial water storage, GPM IMERG precipitat
 notebooks/   # 01 download → 02 SWS / Fig S11 shapefile → 03 paper analysis
 src/         # Python modules imported by the notebooks
 data/        # raw (download), interim (Zarr), processed (shipped tables / boundaries)
-outputs/     # figures, tables, rasters (shipped for this release; also recreated by notebooks)
+outputs/     # figures, tables, rasters (included here; also recreated by notebooks)
 ```
 
 ## Setup
@@ -35,7 +35,7 @@ python -m ipykernel install --user --name grace-arid --display-name "Python (gra
 
 ### 2. Optional extras (only for specific cells)
 
-These are **not** required for the default manuscript path. Install only if you run the cells that need them:
+These are **not** required for the default analysis path. Install only if you run the cells that need them:
 
 ```bash
 # Interactive TWSA–CPA pixel map in notebook 03 (QC only; not a manuscript figure)
@@ -98,8 +98,6 @@ Manuscript figures and tables are already under `outputs/`, and notebook `03` us
 
 Re-running the full download path is heavy: daily IMERG is about 250 GB. After notebook `01` builds the monthly Zarr stores, optional commented cleanup cells can delete those raw granules (see [`data/README.md`](data/README.md#disk-usage-and-cleanup)). The much smaller interim products (`data/interim/gpm/` ~5 GB and `data/interim/gldas/` ~0.3 GB) are enough to re-run most of the analysis without re-downloading raw IMERG/GLDAS. GRACE mascons (~0.7 GB) are still downloaded directly in notebook `01`.
 
-This GitHub repository is private during peer review. Reviewer access is through the Zenodo restricted link once that deposit is ready (see Citation below).
-
 ## Outputs
 
 Figures and tables are written under `outputs/` and are included in this release. The Fig S11 lake-point shapefile used by notebook `03` is produced by notebook `02` under `data/raw/sws/shapefiles/`; it is not shipped in git, so run notebook `02` if you need that file locally.
@@ -113,11 +111,11 @@ Re-running with a newer download may therefore shift some grid-cell counts sligh
 
 ## Citation
 
-Please cite this archive as:
+Please cite this software as:
 
-> Saleh, H. (2026). *A global, event-based assessment of aquifer response to extreme precipitation in arid regions* (Version 0.1.0) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.XXXXXXXX
+> Saleh, H. (2026). *A global, event-based assessment of aquifer response to extreme precipitation in arid regions* (Version 0.1.0) [Software]. Zenodo. https://doi.org/10.5281/zenodo.XXXXXXX
 
-Replace the DOI above (and in [`CITATION.cff`](CITATION.cff)) after the Zenodo deposit is created. When the manuscript is published, its citation and DOI will be added here as well.
+Also see [`CITATION.cff`](CITATION.cff).
 
 ## License
 

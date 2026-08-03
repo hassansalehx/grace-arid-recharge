@@ -1,8 +1,7 @@
 cff-version: 1.2.0
 message: >
-  Prefer the Zenodo DOI (see README Open Research) for citing this archive.
-  Cite the associated manuscript when available. The doi field below will be
-  filled after the Zenodo deposit is created.
+  If you use this software, please cite it using the metadata in this file
+  (and the Zenodo DOI once available).
 title: "A global, event-based assessment of aquifer response to extreme precipitation in arid regions"
 authors:
   - family-names: Saleh
@@ -12,7 +11,7 @@ version: 0.1.0
 date-released: "2026-08-02"
 license: MIT
 repository-code: "https://github.com/hassansalehx/grace-arid-recharge"
-# doi: "10.5281/zenodo.XXXXXXXX"   # uncomment and set after Zenodo reserves the DOI
+# doi: "10.5281/zenodo.XXXXXXX"   # uncomment and set after Zenodo assigns the DOI
 keywords:
   - GRACE
   - groundwater
