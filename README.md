@@ -1,5 +1,7 @@
 # A global, event-based assessment of aquifer response to extreme precipitation in arid regions
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21778709.svg)](https://doi.org/10.5281/zenodo.21778709)
+
 This repository contains the analysis code, notebooks, and derived products that accompany the study.
 
 The workflow uses GRACE/GRACE-FO terrestrial water storage, GPM IMERG precipitation, GLDAS land-surface models, HydroLAKES/GloLakes surface-water storage, and in-situ groundwater wells.
@@ -113,7 +115,7 @@ Re-running with a newer download may therefore shift some grid-cell counts sligh
 
 Please cite this software as:
 
-> Saleh, H. (2026). *A global, event-based assessment of aquifer response to extreme precipitation in arid regions* (Version 0.1.0) [Software]. Zenodo.
+> Saleh, H. (2026). *A global, event-based assessment of aquifer response to extreme precipitation in arid regions* (Version 0.1.0) [Software]. Zenodo. https://doi.org/10.5281/zenodo.21778709
 
 Also see [`CITATION.cff`](CITATION.cff).
 

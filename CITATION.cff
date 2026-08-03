@@ -1,17 +1,16 @@
 cff-version: 1.2.0
 message: >
-  If you use this software, please cite it using the metadata in this file
-  (and the Zenodo DOI once available).
+  If you use this software, please cite it using the metadata in this file.
 title: "A global, event-based assessment of aquifer response to extreme precipitation in arid regions"
 authors:
   - family-names: Saleh
     given-names: Hassan
     affiliation: Western Michigan University
 version: 0.1.0
-date-released: "2026-08-02"
+date-released: "2026-08-03"
+doi: "10.5281/zenodo.21778709"
 license: MIT
 repository-code: "https://github.com/hassansalehx/grace-arid-recharge"
-# doi: "10.5281/zenodo.XXXXXXX"   # uncomment and set after Zenodo assigns the DOI
 keywords:
   - GRACE
   - groundwater
