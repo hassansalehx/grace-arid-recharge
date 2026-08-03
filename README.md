@@ -113,7 +113,7 @@ Re-running with a newer download may therefore shift some grid-cell counts sligh
 
 Please cite this software as:
 
-> Saleh, H. (2026). *A global, event-based assessment of aquifer response to extreme precipitation in arid regions* (Version 0.1.0) [Software]. Zenodo. https://doi.org/10.5281/zenodo.XXXXXXX
+> Saleh, H. (2026). *A global, event-based assessment of aquifer response to extreme precipitation in arid regions* (Version 0.1.0) [Software]. Zenodo.
 
 Also see [`CITATION.cff`](CITATION.cff).
 
