@@ -7,6 +7,9 @@ paths.yaml
 config/paths.yaml
 .cursor/
 
+# Internal handoff notes (local paths; not for release)
+docs/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -54,3 +57,6 @@ Thumbs.db
 *.log
 neff_diagnostic.png
 .env.example.bak
+
+# QC well–GRACE timeseries (regenerable; exclude from release)
+outputs/figures/GWLA-GRACE_Timeseries/

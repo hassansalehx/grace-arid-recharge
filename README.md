@@ -1,8 +1,10 @@
-# GRACE arid-region extreme precipitation recharge
+# A global, event-based assessment of aquifer response to extreme precipitation in arid regions
 
-This repository contains the analysis code, notebooks, and derived products for a global, event-based assessment of aquifer response to extreme precipitation in arid and hyper-arid regions. The workflow uses GRACE/GRACE-FO terrestrial water storage, GPM IMERG precipitation, GLDAS land-surface models, HydroLAKES/GloLakes surface-water storage, and in-situ groundwater wells.
+This repository contains the analysis code, notebooks, and derived products that accompany the study.
 
-**Authors:** Hassan Saleh, Mohamed Sultan (Western Michigan University)
+The workflow uses GRACE/GRACE-FO terrestrial water storage, GPM IMERG precipitation, GLDAS land-surface models, HydroLAKES/GloLakes surface-water storage, and in-situ groundwater wells.
+
+**Author:** Hassan Saleh (Western Michigan University)
 
 ## Repository layout
 
@@ -11,7 +13,6 @@ notebooks/   # 01 download → 02 SWS / Fig S11 shapefile → 03 paper analysis
 src/         # Python modules imported by the notebooks
 data/        # raw (download), interim (Zarr), processed (shipped tables / boundaries)
 outputs/     # figures, tables, rasters (shipped for this release; also recreated by notebooks)
-docs/        # developer notes and manuscript–code map
 ```
 
 ## Setup
@@ -47,7 +48,7 @@ pip install odfpy
 
 ### 3. Credentials (downloads)
 
-- **NASA Earthdata Login** for IMERG / GLDAS in notebook `01`: configure [`earthaccess`](https://earthaccess.readthedocs.io/) (typically `~/.netrc`). Details are in the notebook auth section.
+- **NASA Earthdata Login** for IMERG / GLDAS in notebook `01`: see the [`earthaccess` authentication guide](https://earthaccess.readthedocs.io/en/latest/user/explanation/authenticate/) (interactive prompt, `~/.netrc`, or environment variables). Details are also in the notebook `01` auth section.
 - Notebook `02` (GloLakes + HydroLAKES) needs **no API keys**.
 
 ### 4. Packages
@@ -114,7 +115,7 @@ Re-running with a newer download may therefore shift a few pixel-level counts by
 
 Derived datasets in this study, including the recharge efficiency grid and per-domain statistics, are deposited in Zenodo at [DOI link]. Statistical analyses were performed and figures generated using Python 3.11. The analysis workflow is available at [Zenodo DOI].
 
-See also [`CITATION.cff`](CITATION.cff). Please cite the associated manuscript when available.
+Please cite the associated manuscript when available. After the Zenodo DOI is assigned, [`CITATION.cff`](CITATION.cff) can be updated to include that DOI for GitHub's optional "Cite this repository" button.
 
 ## License
 
@@ -122,5 +123,4 @@ MIT — see [`LICENSE`](LICENSE).
 
 ## Notes for developers
 
-- Internal handoff notes: [`docs/`](docs/).
 - Large raw granules and interim Zarr stores are **not** stored in git; they are produced when you run notebooks `01`–`03`.
