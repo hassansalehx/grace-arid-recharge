@@ -25,6 +25,39 @@ QC_STUCK_STD_THRESHOLD = 0.05
 # -----------------------------------------------------------------------------
 # Helper utilities (reuse across correlation/plotting)
 # -----------------------------------------------------------------------------
+def _import_tqdm():
+    """Import tqdm with Jupyter-friendly fallback. Returns (tqdm_or_None, use_tqdm)."""
+    try:
+        from tqdm.auto import tqdm
+        return tqdm, True
+    except ImportError:
+        try:
+            from tqdm import tqdm
+            return tqdm, True
+        except ImportError:
+            warnings.warn("tqdm not available. Install with 'pip install tqdm' for progress bars.")
+            return None, False
+
+
+def _require_cartopy(error_message: str):
+    """Import cartopy CRS/feature or raise ModuleNotFoundError with *error_message*."""
+    try:
+        import cartopy.crs as ccrs
+        import cartopy.feature as cfeature
+        return ccrs, cfeature
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(error_message) from e
+
+
+def _format_pvalue(p) -> str:
+    """Format a correlation p-value as stored on well GeoDataFrames."""
+    if p < 0.01:
+        return '<0.01'
+    if p < 0.05:
+        return '<0.05'
+    return f'{p:.2f}'
+
+
 def _apply_sign_flip(series: pd.Series, parameter_type) -> pd.Series:
     """Flip sign if parameter_type indicates depth measurement."""
     if parameter_type is None:
@@ -727,17 +760,7 @@ def preprocess_groundwater_data(
     # ============================================================================
     # STEP 2: Read monitoring files
     # ============================================================================
-    # Import tqdm for progress bar (use tqdm.auto for Jupyter notebook compatibility)
-    try:
-        from tqdm.auto import tqdm
-        use_tqdm = True
-    except ImportError:
-        try:
-            from tqdm import tqdm
-            use_tqdm = True
-        except ImportError:
-            use_tqdm = False
-            warnings.warn("tqdm not available. Install with 'pip install tqdm' for progress bars.")
+    tqdm, use_tqdm = _import_tqdm()
     
     # Find all ODS files in monitoring folder (recursively, including subfolders)
     monitoring_files = sorted(monitoring_folder.rglob("*.ods"))
@@ -1286,17 +1309,7 @@ def preprocess_all_countries(
     print(f"Found {len(country_folders)} country folders to process")
     print("="*70)
     
-    # Import tqdm for progress bar (use tqdm.auto for Jupyter notebook compatibility)
-    try:
-        from tqdm.auto import tqdm
-        use_tqdm = True
-    except ImportError:
-        try:
-            from tqdm import tqdm
-            use_tqdm = True
-        except ImportError:
-            use_tqdm = False
-            warnings.warn("tqdm not available. Install with 'pip install tqdm' for progress bars.")
+    tqdm, use_tqdm = _import_tqdm()
     
     # Storage for results
     all_well_locations = []
@@ -1780,14 +1793,10 @@ def plot_all_well_locations(
         Dictionary with 'figure' and 'axis' keys
     """
     # Cartopy is an optional dependency: only needed for map plotting
-    try:
-        import cartopy.crs as ccrs
-        import cartopy.feature as cfeature
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "Cartopy is required for `plot_all_well_locations`, but it is not installed in this environment. "
-            "Install it (e.g., `conda install -c conda-forge cartopy`) or skip plotting."
-        ) from e
+    ccrs, cfeature = _require_cartopy(
+        "Cartopy is required for `plot_all_well_locations`, but it is not installed in this environment. "
+        "Install it (e.g., `conda install -c conda-forge cartopy`) or skip plotting."
+    )
 
     if len(well_locations) == 0:
         warnings.warn("No well locations to plot")
@@ -2081,6 +2090,8 @@ def plot_all_well_locations(
     plt.tight_layout()
     
     if save_path:
+        from pathlib import Path
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Plot saved to: {save_path}")
     
@@ -2090,8 +2101,17 @@ def plot_all_well_locations(
 
 def print_well_info(gw_data):
     """Print one-line summary: well count, date range, water level range."""
-    n = len(gw_data['well_locations'])
-    ts = gw_data['time_series']
+    locations = gw_data.get('well_locations') if isinstance(gw_data, dict) else None
+    ts = gw_data.get('time_series') if isinstance(gw_data, dict) else None
+    if locations is None or len(locations) == 0:
+        print("Wells: 0 | Date range: N/A | Water level: N/A")
+        warnings.warn("print_well_info: no well locations available.")
+        return
+    n = len(locations)
+    if ts is None or getattr(ts, 'empty', True) or len(ts) == 0:
+        print(f"Wells: {n} | Date range: N/A | Water level: N/A")
+        warnings.warn("print_well_info: time series is empty; cannot summarize date/water-level range.")
+        return
     vals = ts.values.flatten()[~np.isnan(ts.values.flatten())]
     wl = f"{np.nanmin(vals):.2f} to {np.nanmax(vals):.2f}" if len(vals) else "N/A"
     print(f"Wells: {n} | Date range: {ts.index.min().strftime('%Y-%m-%d')} to {ts.index.max().strftime('%Y-%m-%d')} | Water level: {wl}")
@@ -2117,16 +2137,32 @@ def save_groundwater_data(well_locations, time_series, base_path, prefix='all_co
     dict
         Dictionary with paths to saved files
     """
+    if well_locations is None or len(well_locations) == 0:
+        warnings.warn("save_groundwater_data: well_locations is empty; nothing to save.")
+        return {}
+    if time_series is None or getattr(time_series, 'empty', True) or len(time_series) == 0:
+        warnings.warn("save_groundwater_data: time_series is empty; nothing to save.")
+        return {}
+
     base_path_obj = Path(base_path)
-    base_path_obj.mkdir(parents=True, exist_ok=True)
+    try:
+        base_path_obj.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise OSError(f"Failed to create output directory {base_path_obj}: {e}") from e
     
     # Save well locations
     locations_path = base_path_obj / f"{prefix}_well_locations.csv"
-    well_locations.to_csv(locations_path, index=False)
+    try:
+        well_locations.to_csv(locations_path, index=False)
+    except OSError as e:
+        raise OSError(f"Failed to save well locations to {locations_path}: {e}") from e
     
     # Save time series
     timeseries_path = base_path_obj / f"{prefix}_time_series.csv"
-    time_series.to_csv(timeseries_path)
+    try:
+        time_series.to_csv(timeseries_path)
+    except OSError as e:
+        raise OSError(f"Failed to save time series to {timeseries_path}: {e}") from e
     
     saved_paths = {
         'well_locations': str(locations_path),
@@ -2612,6 +2648,7 @@ def correlate_wells_with_grace(
     recharge_level_quantile=0.5,
     mask_by_rate=False,
     decomposition_method: str = 'harmonic',
+    verbose=False,
 ):
     """
     Correlate groundwater well time series with GRACE TWS and GWS.
@@ -2667,6 +2704,11 @@ def correlate_wells_with_grace(
         to GW levels (mask values below Q1 - 1.5*IQR); if True, apply the
         fence to month-to-month rates of change dh/dt (mask negative rate
         outliers).
+    verbose : bool, default=False
+        If True, print step-by-step progress, exclusion diagnostics, and the full
+        Raw/Residual x Shallow/Deep correlation summary. Default prints only a
+        concise wells-kept line and shallow-well summary (the violin plots show
+        the full distributions).
     decomposition_method : {'harmonic', 'stl_13'}, default='harmonic'
         Decomposition used for GW and GRACE anomaly time series. 'harmonic' uses the existing
         global linear + annual + semi-annual fit. 'stl_13' uses STL with 13-month seasonal/trend
@@ -2686,29 +2728,33 @@ def correlate_wells_with_grace(
     import pandas as pd
     from shapely.geometry import Point
     from scipy.stats import pearsonr, spearmanr, kendalltau
+
+    def _vprint(*args, **kwargs):
+        if verbose:
+            print(*args, **kwargs)
     
-    print("="*70)
-    print("CORRELATING WELLS WITH GRACE DATA (raw + residual in one pass)")
-    print("="*70)
+    _vprint("="*70)
+    _vprint("CORRELATING WELLS WITH GRACE DATA (raw + residual in one pass)")
+    _vprint("="*70)
     
     # Classify wells by depth (Shallow/Deep) before correlation
-    print(f"\nStep 0: Classifying wells by depth (threshold = {depth_threshold}m)...")
+    _vprint(f"\nStep 0: Classifying wells by depth (threshold = {depth_threshold}m)...")
     well_locations_classified = classify_well_depths(
-        well_locations.copy(), well_time_series, depth_threshold=depth_threshold, verbose=True
+        well_locations.copy(), well_time_series, depth_threshold=depth_threshold, verbose=verbose
     )
     
     # Convert well_locations to GeoDataFrame
-    print(f"\nStep 1: Converting well locations to GeoDataFrame...")
+    _vprint(f"\nStep 1: Converting well locations to GeoDataFrame...")
     well_gdf = gpd.GeoDataFrame(
         well_locations_classified,
         geometry=[Point(lon, lat) for lon, lat in zip(well_locations['Longitude'], well_locations['Latitude'])],
         crs="EPSG:4326"
     )
-    print(f"  Total wells: {len(well_gdf)}")
+    _vprint(f"  Total wells: {len(well_gdf)}")
     
     # Clip to AOI if provided
     if aoi_geometry is not None:
-        print(f"\nStep 2: Clipping wells to AOI geometry...")
+        _vprint(f"\nStep 2: Clipping wells to AOI geometry...")
         if isinstance(aoi_geometry, gpd.GeoSeries):
             aoi_gdf = gpd.GeoDataFrame(geometry=aoi_geometry, crs=aoi_geometry.crs).to_crs("EPSG:4326")
         elif isinstance(aoi_geometry, gpd.GeoDataFrame):
@@ -2721,14 +2767,17 @@ def correlate_wells_with_grace(
         # Remove the index_right column added by sjoin
         well_gdf = well_gdf.drop(columns=[col for col in well_gdf.columns if col == 'index_right'], errors='ignore')
         wells_after_clip = len(well_gdf)
-        print(f"  Wells before clipping: {wells_before_clip}")
-        print(f"  Wells removed: {wells_before_clip - wells_after_clip}")
-        print(f"  Wells after clipping: {wells_after_clip}")   
+        _vprint(f"  Wells before clipping: {wells_before_clip}")
+        _vprint(f"  Wells removed: {wells_before_clip - wells_after_clip}")
+        _vprint(f"  Wells after clipping: {wells_after_clip}")   
     else:
-        print(f"\nStep 2: No AOI geometry provided, using all wells...")
+        _vprint(f"\nStep 2: No AOI geometry provided, using all wells...")
     
     if len(well_gdf) == 0:
-        warnings.warn("No wells remaining after clipping. Returning empty dict.")
+        warnings.warn(
+            "No wells remaining after clipping. Returning structured empty result "
+            "({'raw': empty GDF, 'residual': empty GDF, 'well_series': {}, 'grace_series': {}})."
+        )
         well_gdf['corr_tws'] = np.nan
         well_gdf['corr_gws'] = np.nan
         well_gdf['pvalue_tws'] = None
@@ -2742,7 +2791,7 @@ def correlate_wells_with_grace(
         return {'raw': gdf_raw, 'residual': gdf_res, 'well_series': {}, 'grace_series': {}}
     
     # Get GRACE grid coordinates
-    print(f"\nStep 3: Finding nearest GRACE pixels for each well...")
+    _vprint(f"\nStep 3: Finding nearest GRACE pixels for each well...")
     
     # Find nearest GRACE pixel for each well using xarray's nearest neighbor selection
     # This correctly finds the grid point closest to the well location
@@ -2792,21 +2841,21 @@ def correlate_wells_with_grace(
             nearby_lats = grace_lats[lat_mask]
             nearby_lons = grace_lons[lon_mask]
             
-            print(f"\n  Well {idx}: ({well_lat:.5f}°, {well_lon:.5f}°)")
-            print(f"    Nearby GRACE grid points:")
+            _vprint(f"\n  Well {idx}: ({well_lat:.5f}°, {well_lon:.5f}°)")
+            _vprint(f"    Nearby GRACE grid points:")
             for glat in nearby_lats:
                 for glon in nearby_lons:
                     glat_idx = np.where(grace_lats == glat)[0][0]
                     glon_idx = np.where(grace_lons == glon)[0][0]
                     dist = distances_deg[glat_idx, glon_idx]
                     marker = " <-- SELECTED" if (glat == assigned_lat and glon == assigned_lon) else ""
-                    print(f"      ({glat:.1f}°, {glon:.1f}°): distance = {dist:.6f}°{marker}")
-            print(f"    Assigned to: ({assigned_lat:.1f}°, {assigned_lon:.1f}°) with distance {min_distance:.6f}°")
+                    _vprint(f"      ({glat:.1f}°, {glon:.1f}°): distance = {dist:.6f}°{marker}")
+            _vprint(f"    Assigned to: ({assigned_lat:.1f}°, {assigned_lon:.1f}°) with distance {min_distance:.6f}°")
     
-    print(f"  Mapped {len(well_gdf)} wells to GRACE grid")
+    _vprint(f"  Mapped {len(well_gdf)} wells to GRACE grid")
     
     # Convert well_time_series index to datetime if needed and handle timezone
-    print(f"\nStep 4: Extracting GRACE time series and calculating correlations...")
+    _vprint(f"\nStep 4: Extracting GRACE time series and calculating correlations...")
     
     well_ts_index = pd.to_datetime(well_time_series.index)
     grace_time_index = pd.to_datetime(grace_mean.time.values)
@@ -2855,6 +2904,7 @@ def correlate_wells_with_grace(
     # Calculate correlations for each well
     correlations_found = 0
     correlations_failed = 0
+    correlations_gws_failed = 0
     
     # Diagnostic counters
     excluded_no_timeseries = 0
@@ -2877,17 +2927,17 @@ def correlate_wells_with_grace(
     matching_ids = well_ids_in_gdf & well_ids_in_timeseries
     missing_ids = well_ids_in_gdf - well_ids_in_timeseries
     
-    print(f"\n  Well ID matching check:")
-    print(f"    Wells in GeoDataFrame: {len(well_ids_in_gdf)}")
-    print(f"    Wells in time_series: {len(well_ids_in_timeseries)}")
-    print(f"    Matching IDs: {len(matching_ids)}")
-    print(f"    Missing IDs: {len(missing_ids)}")
+    _vprint(f"\n  Well ID matching check:")
+    _vprint(f"    Wells in GeoDataFrame: {len(well_ids_in_gdf)}")
+    _vprint(f"    Wells in time_series: {len(well_ids_in_timeseries)}")
+    _vprint(f"    Matching IDs: {len(matching_ids)}")
+    _vprint(f"    Missing IDs: {len(missing_ids)}")
     if len(missing_ids) > 0 and len(missing_ids) <= 10:
-        print(f"    Sample missing IDs: {list(missing_ids)[:10]}")
+        _vprint(f"    Sample missing IDs: {list(missing_ids)[:10]}")
     elif len(missing_ids) > 10:
-        print(f"    Sample missing IDs (first 10): {list(missing_ids)[:10]}")
+        _vprint(f"    Sample missing IDs (first 10): {list(missing_ids)[:10]}")
     if len(matching_ids) > 0 and len(matching_ids) <= 10:
-        print(f"    Sample matching IDs: {list(matching_ids)[:10]}")
+        _vprint(f"    Sample matching IDs: {list(matching_ids)[:10]}")
     
     # Two GeoDataFrames: raw and residual correlations (computed in one pass)
     well_gdf_raw = well_gdf.copy()
@@ -3031,22 +3081,12 @@ def correlate_wells_with_grace(
                 if mask0.sum() >= min_common_dates:
                     corr_tws_lag0, pvalue_tws_lag0 = corr_func(well_vals[mask0], grace_vals[mask0])
                     well_gdf_raw.at[idx, 'corr_tws_lag0'] = corr_tws_lag0
-                    if pvalue_tws_lag0 < 0.01:
-                        well_gdf_raw.at[idx, 'pvalue_tws_lag0'] = '<0.01'
-                    elif pvalue_tws_lag0 < 0.05:
-                        well_gdf_raw.at[idx, 'pvalue_tws_lag0'] = '<0.05'
-                    else:
-                        well_gdf_raw.at[idx, 'pvalue_tws_lag0'] = f'{pvalue_tws_lag0:.2f}'
+                    well_gdf_raw.at[idx, 'pvalue_tws_lag0'] = _format_pvalue(pvalue_tws_lag0)
                 tws_res = _calculate_best_lag_correlation(well_tws_raw, grace_tws_raw, max_lag_months, min_common_dates, corr_func)
                 if not np.isnan(tws_res['r_max']):
                     well_gdf_raw.at[idx, 'corr_tws'] = tws_res['r_max']
                     well_gdf_raw.at[idx, 'lag_tws'] = tws_res['lag_max']
-                    if tws_res['p_max'] < 0.01:
-                        well_gdf_raw.at[idx, 'pvalue_tws'] = '<0.01'
-                    elif tws_res['p_max'] < 0.05:
-                        well_gdf_raw.at[idx, 'pvalue_tws'] = '<0.05'
-                    else:
-                        well_gdf_raw.at[idx, 'pvalue_tws'] = f"{tws_res['p_max']:.2f}"
+                    well_gdf_raw.at[idx, 'pvalue_tws'] = _format_pvalue(tws_res['p_max'])
                     correlations_found += 1
 
             # Residual TWS: use precomputed decomposition
@@ -3061,22 +3101,12 @@ def correlate_wells_with_grace(
                 if mask0.sum() >= min_common_dates:
                     corr_tws_lag0, pvalue_tws_lag0 = corr_func(well_vals[mask0], grace_vals[mask0])
                     well_gdf_res.at[idx, 'corr_tws_lag0'] = corr_tws_lag0
-                    if pvalue_tws_lag0 < 0.01:
-                        well_gdf_res.at[idx, 'pvalue_tws_lag0'] = '<0.01'
-                    elif pvalue_tws_lag0 < 0.05:
-                        well_gdf_res.at[idx, 'pvalue_tws_lag0'] = '<0.05'
-                    else:
-                        well_gdf_res.at[idx, 'pvalue_tws_lag0'] = f'{pvalue_tws_lag0:.2f}'
+                    well_gdf_res.at[idx, 'pvalue_tws_lag0'] = _format_pvalue(pvalue_tws_lag0)
                 tws_res = _calculate_best_lag_correlation(well_tws_res, grace_tws_res, max_lag_months, min_common_dates, corr_func)
                 if not np.isnan(tws_res['r_max']):
                     well_gdf_res.at[idx, 'corr_tws'] = tws_res['r_max']
                     well_gdf_res.at[idx, 'lag_tws'] = tws_res['lag_max']
-                    if tws_res['p_max'] < 0.01:
-                        well_gdf_res.at[idx, 'pvalue_tws'] = '<0.01'
-                    elif tws_res['p_max'] < 0.05:
-                        well_gdf_res.at[idx, 'pvalue_tws'] = '<0.05'
-                    else:
-                        well_gdf_res.at[idx, 'pvalue_tws'] = f"{tws_res['p_max']:.2f}"
+                    well_gdf_res.at[idx, 'pvalue_tws'] = _format_pvalue(tws_res['p_max'])
         except Exception as e:
             excluded_grace_extraction_error += 1
             correlations_failed += 1
@@ -3099,12 +3129,7 @@ def correlate_wells_with_grace(
                     if mask0.sum() >= min_common_dates:
                         corr_gws_lag0, pvalue_gws_lag0 = corr_func(well_vals[mask0], grace_gws_vals[mask0])
                         well_gdf_raw.at[idx, 'corr_gws_lag0'] = corr_gws_lag0
-                        if pvalue_gws_lag0 < 0.01:
-                            well_gdf_raw.at[idx, 'pvalue_gws_lag0'] = '<0.01'
-                        elif pvalue_gws_lag0 < 0.05:
-                            well_gdf_raw.at[idx, 'pvalue_gws_lag0'] = '<0.05'
-                        else:
-                            well_gdf_raw.at[idx, 'pvalue_gws_lag0'] = f'{pvalue_gws_lag0:.2f}'
+                        well_gdf_raw.at[idx, 'pvalue_gws_lag0'] = _format_pvalue(pvalue_gws_lag0)
 
                     gws_corr_result = _calculate_best_lag_correlation(
                         well_gws_raw, grace_gws_raw, max_lag_months, min_common_dates, corr_func
@@ -3115,12 +3140,7 @@ def correlate_wells_with_grace(
                     if not np.isnan(best_corr_gws):
                         well_gdf_raw.at[idx, 'corr_gws'] = best_corr_gws
                         well_gdf_raw.at[idx, 'lag_gws'] = best_lag_gws
-                        if best_pvalue_gws < 0.01:
-                            well_gdf_raw.at[idx, 'pvalue_gws'] = '<0.01'
-                        elif best_pvalue_gws < 0.05:
-                            well_gdf_raw.at[idx, 'pvalue_gws'] = '<0.05'
-                        else:
-                            well_gdf_raw.at[idx, 'pvalue_gws'] = f'{best_pvalue_gws:.2f}'
+                        well_gdf_raw.at[idx, 'pvalue_gws'] = _format_pvalue(best_pvalue_gws)
 
                 # Residual GWS: use precomputed decomposition
                 well_gws_res = well_decomp['residual'].dropna()
@@ -3134,12 +3154,7 @@ def correlate_wells_with_grace(
                     if mask0.sum() >= min_common_dates:
                         corr_gws_lag0, pvalue_gws_lag0 = corr_func(well_vals[mask0], grace_gws_vals[mask0])
                         well_gdf_res.at[idx, 'corr_gws_lag0'] = corr_gws_lag0
-                        if pvalue_gws_lag0 < 0.01:
-                            well_gdf_res.at[idx, 'pvalue_gws_lag0'] = '<0.01'
-                        elif pvalue_gws_lag0 < 0.05:
-                            well_gdf_res.at[idx, 'pvalue_gws_lag0'] = '<0.05'
-                        else:
-                            well_gdf_res.at[idx, 'pvalue_gws_lag0'] = f'{pvalue_gws_lag0:.2f}'
+                        well_gdf_res.at[idx, 'pvalue_gws_lag0'] = _format_pvalue(pvalue_gws_lag0)
 
                     gws_res_result = _calculate_best_lag_correlation(
                         well_gws_res, grace_gws_res, max_lag_months, min_common_dates, corr_func
@@ -3147,55 +3162,53 @@ def correlate_wells_with_grace(
                     if not np.isnan(gws_res_result['r_max']):
                         well_gdf_res.at[idx, 'corr_gws'] = gws_res_result['r_max']
                         well_gdf_res.at[idx, 'lag_gws'] = gws_res_result['lag_max']
-                        if gws_res_result['p_max'] < 0.01:
-                            well_gdf_res.at[idx, 'pvalue_gws'] = '<0.01'
-                        elif gws_res_result['p_max'] < 0.05:
-                            well_gdf_res.at[idx, 'pvalue_gws'] = '<0.05'
-                        else:
-                            well_gdf_res.at[idx, 'pvalue_gws'] = f"{gws_res_result['p_max']:.2f}"
+                        well_gdf_res.at[idx, 'pvalue_gws'] = _format_pvalue(gws_res_result['p_max'])
             except Exception as e:
+                correlations_gws_failed += 1
                 continue
     
-    print(f"  Correlations calculated: {correlations_found}")
+    _vprint(f"  Correlations calculated: {correlations_found}")
     if correlations_failed > 0:
-        print(f"  Correlations failed: {correlations_failed}")
+        _vprint(f"  Correlations failed: {correlations_failed}")
+    if not tws_only and correlations_gws_failed > 0:
+        _vprint(f"  GWS correlations failed: {correlations_gws_failed}")
     
     # Print diagnostic information
-    print(f"\n  Diagnostic: Why wells were excluded:")
-    print(f"    - Missing time series data: {excluded_no_timeseries}")
-    print(f"    - Stuck sensor (rolling std < 0.05m): {excluded_stuck_sensor}")
-    print(f"    - Insufficient data after QC (< {min_common_dates} points): {excluded_insufficient_data_after_qc}")
-    print(f"    - Insufficient common dates with GRACE (< {min_common_dates}): {excluded_insufficient_common_dates}")
-    print(f"    - GRACE extraction error: {excluded_grace_extraction_error}")
+    _vprint(f"\n  Diagnostic: Why wells were excluded:")
+    _vprint(f"    - Missing time series data: {excluded_no_timeseries}")
+    _vprint(f"    - Stuck sensor (rolling std < 0.05m): {excluded_stuck_sensor}")
+    _vprint(f"    - Insufficient data after QC (< {min_common_dates} points): {excluded_insufficient_data_after_qc}")
+    _vprint(f"    - Insufficient common dates with GRACE (< {min_common_dates}): {excluded_insufficient_common_dates}")
+    _vprint(f"    - GRACE extraction error: {excluded_grace_extraction_error}")
     
     # Print summary statistics
-    print("\n" + "="*70)
-    print(f"CORRELATION SUMMARY  —  method: {method}")
-    print("="*70)
+    _vprint("\n" + "="*70)
+    _vprint(f"CORRELATION SUMMARY  —  method: {method}")
+    _vprint("="*70)
 
     def _print_corr_stats(subset, indent="  "):
         n_tws = subset['corr_tws'].notna().sum()
         n_gws = subset['corr_gws'].notna().sum()
         if n_tws > 0:
-            print(f"{indent}TWS: n={n_tws}, mean={subset['corr_tws'].mean():.2f}, "
+            _vprint(f"{indent}TWS: n={n_tws}, mean={subset['corr_tws'].mean():.2f}, "
                   f"median={subset['corr_tws'].median():.2f}, "
                   f"min={subset['corr_tws'].min():.2f}, max={subset['corr_tws'].max():.2f}")
             if 'lag_tws' in subset.columns:
-                print(f"{indent}TWS mean lag (months): {subset['lag_tws'].mean():.1f}")
+                _vprint(f"{indent}TWS mean lag (months): {subset['lag_tws'].mean():.1f}")
         if not tws_only and n_gws > 0:
-            print(f"{indent}GWS: n={n_gws}, mean={subset['corr_gws'].mean():.2f}, "
+            _vprint(f"{indent}GWS: n={n_gws}, mean={subset['corr_gws'].mean():.2f}, "
                   f"median={subset['corr_gws'].median():.2f}, "
                   f"min={subset['corr_gws'].min():.2f}, max={subset['corr_gws'].max():.2f}")
             if 'lag_gws' in subset.columns:
-                print(f"{indent}GWS mean lag (months): {subset['lag_gws'].mean():.1f}")
+                _vprint(f"{indent}GWS mean lag (months): {subset['lag_gws'].mean():.1f}")
 
     def _print_summary(gdf, label):
         n_tws = gdf['corr_tws'].notna().sum()
         n_gws = gdf['corr_gws'].notna().sum()
-        print(f"\n{label} (all wells):")
-        print(f"  Wells with TWS correlation: {n_tws} ({n_tws/len(gdf)*100:.1f}%)")
+        _vprint(f"\n{label} (all wells):")
+        _vprint(f"  Wells with TWS correlation: {n_tws} ({n_tws/len(gdf)*100:.1f}%)")
         if not tws_only:
-            print(f"  Wells with GWS correlation: {n_gws} ({n_gws/len(gdf)*100:.1f}%)")
+            _vprint(f"  Wells with GWS correlation: {n_gws} ({n_gws/len(gdf)*100:.1f}%)")
         _print_corr_stats(gdf)
         if 'depth_class' in gdf.columns:
             for dc in ['Shallow', 'Deep']:
@@ -3203,7 +3216,7 @@ def correlate_wells_with_grace(
                 n_dc = sub['corr_tws'].notna().sum()
                 if n_dc == 0:
                     continue
-                print(f"  {label} — {dc} ({n_dc} wells):")
+                _vprint(f"  {label} — {dc} ({n_dc} wells):")
                 _print_corr_stats(sub, indent="    ")
 
     _print_summary(well_gdf_raw, "Raw")
@@ -3219,7 +3232,20 @@ def correlate_wells_with_grace(
     well_gdf_res = well_gdf_res[valid_mask].copy()
     n_after = len(well_gdf_raw)
     if n_after < n_before:
-        print(f"\nFiltered wells by TWS correlation: kept {n_after}/{n_before} wells with non-NaN corr_tws.")
+        _vprint(f"\nFiltered wells by TWS correlation: kept {n_after}/{n_before} wells with non-NaN corr_tws.")
+
+    # Concise summary (always printed; use verbose=True for the full breakdown)
+    print(
+        f"Wells: {n_before} evaluated, {n_after} kept with valid TWS correlation "
+        f"({method}, max lag {max_lag_months} mo)"
+    )
+    if 'depth_class' in well_gdf_res.columns:
+        _sh = well_gdf_res[well_gdf_res['depth_class'] == 'Shallow']
+        if len(_sh) > 0:
+            print(
+                f"Shallow: n={len(_sh)}  TWS residual median rho={_sh['corr_tws'].median():.2f}"
+                + (f"  GWS n={int(_sh['corr_gws'].notna().sum())}" if not tws_only else "")
+            )
 
     # Filter well_series to only wells that remain in well_gdf_raw
     allowed_well_keys = set()
@@ -3371,8 +3397,31 @@ def plot_grace_well_timeseries_comparison(
         locations = [(row['grace_lat'], row['grace_lon']) 
                      for _, row in unique_locations.iterrows()]
         
-        print(f"Generated {len(locations)} unique GRACE pixel locations from geodataframe")
-    
+    # Drop pixels with no usable GRACE TWS *or* GWS series before rendering
+    # (same validity rule as the in-loop check; aligns with common TWS/GWS well set).
+    def _grace_series_usable(grace_lat, grace_lon):
+        key = (float(grace_lat), float(grace_lon))
+        if key not in grace_series_precomputed:
+            return False
+        gs = grace_series_precomputed[key]
+        tws = gs.get('tws')
+        gws = gs.get('gws', tws)
+        if tws is None or gws is None:
+            return False
+        return int(tws.notna().sum()) > 0 and int(gws.notna().sum()) > 0
+
+    n_loc_before = len(locations)
+    locations = [loc for loc in locations if _grace_series_usable(*loc)]
+    n_dropped = n_loc_before - len(locations)
+    if n_dropped > 0:
+        print(
+            f"Excluded {n_dropped}/{n_loc_before} GRACE pixels with all-NaN TWS or GWS "
+            f"(kept {len(locations)} for plotting)"
+        )
+    if len(locations) == 0:
+        warnings.warn("No GRACE pixels with usable TWS and GWS series. Nothing to plot.")
+        return {'saved_files': [], 'correlations': []}
+
     if save_dir:
         save_path_obj = Path(save_dir)
         save_path_obj.mkdir(parents=True, exist_ok=True)
@@ -3380,9 +3429,14 @@ def plot_grace_well_timeseries_comparison(
     saved_files = []
     correlation_results = []  # Collect individual well correlation data
     
-    # Process each location
-    for loc_idx, (grace_lat, grace_lon) in enumerate(locations):
-        print(f"Plotting location {loc_idx + 1}/{len(locations)}: ({grace_lat:.2f}°, {grace_lon:.2f}°)")
+    # Process each location with a single progress bar (per-location prints removed)
+    try:
+        from tqdm.auto import tqdm as _tqdm
+    except ImportError:
+        from tqdm import tqdm as _tqdm
+    _verb = "Saving" if save_dir else "Rendering"
+    print(f"{_verb} well/GRACE time series plots ({len(locations)} locations)...")
+    for loc_idx, (grace_lat, grace_lon) in enumerate(_tqdm(locations, desc="locations", unit="loc")):
         
         # Find all wells assigned to this GRACE pixel
         wells_at_pixel = wells_gdf_plot[
@@ -3411,23 +3465,16 @@ def plot_grace_well_timeseries_comparison(
             wells_at_pixel = wells_at_pixel.nlargest(max_wells_per_plot, '_best_corr')
             wells_at_pixel = wells_at_pixel.drop(columns=['_best_corr'])
             wells_filtered = True
-            print(f"  Limited to top {max_wells_per_plot} wells by highest correlation (from {total_wells_at_pixel} total)")
         
         # Get countries for this pixel (for filename)
         countries = wells_at_pixel['Country'].unique()
         country_str = '_'.join(sorted(countries)) if len(countries) > 0 else 'unknown'
         
-        # Get GRACE series from precomputed (required)
+        # Get GRACE series from precomputed (required; locations already pre-filtered)
         grace_key = (float(grace_lat), float(grace_lon))
-        if grace_key not in grace_series_precomputed:
-            print(f"  GRACE pixel {grace_key} not in precomputed; skipping.")
-            continue
         gs = grace_series_precomputed[grace_key]
         grace_tws_series = gs['tws'].copy()
         grace_gws_series = gs.get('gws', gs['tws']).copy()
-        if grace_tws_series.notna().sum() == 0 or grace_gws_series.notna().sum() == 0:
-            print(f"  Warning: GRACE data is all NaN at this pixel. Skipping...")
-            continue
         
         # Extract rainfall time series at this pixel (if provided)
         rainfall_series = None
@@ -3716,7 +3763,10 @@ def plot_grace_well_timeseries_comparison(
                 for label in ax.yaxis.get_ticklabels():
                     label.set_color('red')
         
-        plt.tight_layout()
+        with warnings.catch_warnings():
+            # Some panels use twin axes that tight_layout cannot handle exactly
+            warnings.simplefilter("ignore", UserWarning)
+            plt.tight_layout()
         if two_panels:
             plt.subplots_adjust(hspace=0.05)
 
@@ -3732,7 +3782,6 @@ def plot_grace_well_timeseries_comparison(
         
         plt.close()
     
-    print(f"\nCompleted plotting {len(locations)} locations")
     if save_dir:
         print(f"Saved {len(saved_files)} plots to: {save_dir}")
     
@@ -3918,6 +3967,8 @@ def plot_correlation_distributions(
     show_stats=True,
     residual=None,
     require_common_tws_gws=False,
+    show_cdf=True,
+    show_tables=True,
 ):
     """
     (1) Violin + box distributions in 2×2 (individual raw+residual) or depth-class layout, unchanged
@@ -3949,6 +4000,10 @@ def plot_correlation_distributions(
         distribution (which would bias |ρ| upward), and optimal-lag p-values are not
         corrected for the multi-lag search or serial correlation.
 
+    show_cdf : bool, default True
+        If False, skip the extra empirical-CDF figure.
+    show_tables : bool, default True
+        If False, skip the summary-table figure.
     require_common_tws_gws : bool, default False
         When True (individual-well mode), keep only wells with valid TWSA **and** GWSA
         correlations for each lag type separately (zero lag and optimal lag). This makes
@@ -3971,21 +4026,9 @@ def plot_correlation_distributions(
     filter_counts = {}
     
     if use_individual:
-        print("Processing individual well correlations (raw + residual, 2x2 layout)...")
-        if require_common_tws_gws:
-            print("  require_common_tws_gws=True: TWSA and GWSA use the same wells per lag type.")
         for gdf, mode in [(wells_gdf_raw, ''), (wells_gdf_residual, ' residual')]:
             state_label = 'anomaly' if mode == '' else 'residual'
             filter_counts[state_label] = _count_common_tws_gws_wells(gdf)
-            if require_common_tws_gws:
-                fc = filter_counts[state_label]
-                for lag_type in ('Lag 0', 'Max Lag'):
-                    c = fc[lag_type]
-                    print(
-                        f"  {state_label} {lag_type}: "
-                        f"TWS={c['n_tws']}, GWS={c['n_gws']}, common={c['n_common']} "
-                        f"(TWS-only={c['n_tws_only']}, GWS-only={c['n_gws_only']})"
-                    )
             for _, row in gdf.iterrows():
                 depth_class = row.get('depth_class', None)
                 if pd.isna(depth_class):
@@ -4015,9 +4058,7 @@ def plot_correlation_distributions(
         data_source = "Individual Wells"
     elif wells_gdf is not None:
         # Individual well correlations
-        print("Processing individual well correlations...")
         if require_common_tws_gws:
-            print("  require_common_tws_gws=True: TWSA and GWSA use the same wells per lag type.")
             filter_counts['single'] = _count_common_tws_gws_wells(wells_gdf)
         for _, row in wells_gdf.iterrows():
             depth_class = row.get('depth_class', None)
@@ -4060,7 +4101,6 @@ def plot_correlation_distributions(
             'depth_classes_residual' in p and p.get('depth_classes_residual')
             for p in depthclass_correlations
         )
-        print(f"Processing depth-class averaged correlations (residual={has_residual_layer})...")
         for pixel_data in depthclass_correlations:
             # Anomaly (raw) correlations
             for depth_class, corr_data in pixel_data.get('depth_classes', {}).items():
@@ -4120,8 +4160,6 @@ def plot_correlation_distributions(
     if len(df) == 0:
         print("No valid correlation data found!")
         return {'stats_summary': {}, 'stats_df': pd.DataFrame(), 'filter_counts': filter_counts}
-    
-    print(f"Total data points: {len(df)}")
 
     use_four_var_table = use_individual or has_residual_layer
     
@@ -4487,12 +4525,14 @@ def plot_correlation_distributions(
         tws_cdf_specs = [{'label': 'TWSA', 'values': _max_lag_series('TWS'), 'color': '#0d3b66', 'linestyle': '-'}]
         gws_cdf_specs = [{'label': 'GWSA', 'values': _max_lag_series('GWS'), 'color': GWSA_PLOT_COLOR, 'linestyle': '-'}]
 
-    cdf_h = max(4.8, figsize[1] * 0.48)
-    fig_cdf, axes_cdf = plt.subplots(1, 2, figsize=(figsize[0], cdf_h))
-    fig_cdf.patch.set_facecolor('white')
-    fig_cdf.subplots_adjust(wspace=0.26, left=0.08, right=0.98, top=0.96, bottom=0.14)
-    _plot_ecdf_max_lag_ax(axes_cdf[0], tws_cdf_specs)
-    _plot_ecdf_max_lag_ax(axes_cdf[1], gws_cdf_specs)
+    fig_cdf = None
+    if show_cdf:
+        cdf_h = max(4.8, figsize[1] * 0.48)
+        fig_cdf, axes_cdf = plt.subplots(1, 2, figsize=(figsize[0], cdf_h))
+        fig_cdf.patch.set_facecolor('white')
+        fig_cdf.subplots_adjust(wspace=0.26, left=0.08, right=0.98, top=0.96, bottom=0.14)
+        _plot_ecdf_max_lag_ax(axes_cdf[0], tws_cdf_specs)
+        _plot_ecdf_max_lag_ax(axes_cdf[1], gws_cdf_specs)
 
     def _summary_cell(var, lag_type, dc):
         key = f'{var}_{lag_type}_{dc}'
@@ -4630,39 +4670,46 @@ def plot_correlation_distributions(
             tbl[(i + 1, 0)].set_text_props(fontweight='bold', fontsize=10, color='black')
         ax.set_title('Summary — median (mean)', fontsize=12, fontweight='bold', pad=6)
 
-    n_rows_tbl = 1
-    if use_four_var_table:
-        n_depth = len(active_depth_order)
-        n_rows_tbl = 2 if n_depth == 1 else 2 * n_depth
-    fig3_h = min(3.5, max(1.15, 0.42 * n_rows_tbl + 0.9))
-    fig3, axes_t = plt.subplots(1, 1, figsize=(10.5, fig3_h))
-    fig3.patch.set_facecolor('white')
-    ax_tbl = fig3.axes[0]
-    if use_four_var_table:
-        _make_merged_anomaly_residual_table(ax_tbl, stats_summary, active_depth_order)
-        cap = (
-            f"Depth class: {', '.join(active_depth_order)}."
-            if len(active_depth_order) == 1
-            else f"Depth classes: {', '.join(active_depth_order)} (row labels indicate depth)."
-        )
-        fig3.text(0.5, 0.02, cap, ha='center', va='bottom', fontsize=8.5, color='#333')
-        fig3.tight_layout(rect=[0.02, 0.08, 0.98, 0.96])
-    else:
-        _make_table(ax_tbl, 'Summary - median (mean)', var_list)
-        fig3.tight_layout()
+    fig3 = None
+    if show_tables:
+        n_rows_tbl = 1
+        if use_four_var_table:
+            n_depth = len(active_depth_order)
+            n_rows_tbl = 2 if n_depth == 1 else 2 * n_depth
+        fig3_h = min(3.5, max(1.15, 0.42 * n_rows_tbl + 0.9))
+        fig3, axes_t = plt.subplots(1, 1, figsize=(10.5, fig3_h))
+        fig3.patch.set_facecolor('white')
+        ax_tbl = fig3.axes[0]
+        if use_four_var_table:
+            _make_merged_anomaly_residual_table(ax_tbl, stats_summary, active_depth_order)
+            cap = (
+                f"Depth class: {', '.join(active_depth_order)}."
+                if len(active_depth_order) == 1
+                else f"Depth classes: {', '.join(active_depth_order)} (row labels indicate depth)."
+            )
+            fig3.text(0.5, 0.02, cap, ha='center', va='bottom', fontsize=8.5, color='#333')
+            fig3.tight_layout(rect=[0.02, 0.08, 0.98, 0.96])
+        else:
+            _make_table(ax_tbl, 'Summary - median (mean)', var_list)
+            fig3.tight_layout()
     
     if save_path:
         from pathlib import Path
         save_path = Path(save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
         stem_base = save_path.stem + residual_stem
+        saved_parts = ['violin']
         fig.savefig(save_path.with_stem(stem_base), dpi=300, bbox_inches='tight')
-        fig_cdf.savefig(save_path.with_stem(stem_base + '_cdf'), dpi=300, bbox_inches='tight')
-        fig3.savefig(save_path.with_stem(stem_base + '_summary'), dpi=300, bbox_inches='tight')
-        print(f"Saved figures to {save_path.parent} (violin, CDF, summary)")
-    else:
-        plt.show()
-    
+        if fig_cdf is not None:
+            fig_cdf.savefig(save_path.with_stem(stem_base + '_cdf'), dpi=300, bbox_inches='tight')
+            saved_parts.append('CDF')
+        if fig3 is not None:
+            fig3.savefig(save_path.with_stem(stem_base + '_summary'), dpi=300, bbox_inches='tight')
+            saved_parts.append('summary')
+        print(f"Saved figures to {save_path.parent} ({', '.join(saved_parts)})")
+
+    # Always show in the notebook / interactive session (even when also saving)
+    plt.show()
     plt.close('all')
     
     
@@ -5162,14 +5209,10 @@ def plot_grace_gwl_correlation_lag_maps(
           - 'data': pandas.DataFrame used for plotting (per-pixel aggregates)
     """
     import matplotlib.pyplot as plt
-    try:
-        import cartopy.crs as ccrs
-        import cartopy.feature as cfeature
-    except ModuleNotFoundError as e:
-        raise ModuleNotFoundError(
-            "Cartopy is required for `plot_grace_gwl_correlation_lag_maps`, but it is not installed. "
-            "Install it (e.g., `conda install -c conda-forge cartopy`) or skip this plot."
-        ) from e
+    ccrs, cfeature = _require_cartopy(
+        "Cartopy is required for `plot_grace_gwl_correlation_lag_maps`, but it is not installed. "
+        "Install it (e.g., `conda install -c conda-forge cartopy`) or skip this plot."
+    )
     import numpy as np
     import pandas as pd
     import matplotlib.ticker as mticker

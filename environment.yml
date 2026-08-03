@@ -12,6 +12,7 @@ dependencies:
   - netcdf4
   - h5netcdf
   - zarr
+  - numcodecs
   - rioxarray
   - rasterio
   - geopandas
@@ -28,6 +29,10 @@ dependencies:
   - jupyter
   - ipykernel
   - earthaccess
+  - dbfread
   - pip
   - pip:
       - pympler
+      # Optional extras (also documented in README.md):
+      # - plotly / ipywidgets: notebook 03 interactive QC map
+      # - odfpy: optional raw IGRAC .ods groundwater reprocessing

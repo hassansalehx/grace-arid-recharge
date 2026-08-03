@@ -20,12 +20,12 @@
 
 | Path | Role |
 |------|------|
-| `notebooks/02_grace_arid_analysis.ipynb` | **Authoritative** main notebook for the paper (≈45 cells / 35 code). Curated subset of the older working notebook; do **not** assume it still matches `Cursor/GRACE_ds_arid_subbasins-analysis_Optimized.ipynb`. |
+| `notebooks/03_grace_arid_analysis.ipynb` | **Authoritative** main notebook for the paper (≈45 cells / 35 code). Curated subset of the older working notebook; do **not** assume it still matches `Cursor/GRACE_ds_arid_subbasins-analysis_Optimized.ipynb`. |
 | `grace_analysis_pixel.py` | Pixel EPE → GRACE response and paper map/diagnostic plots. |
 | `src/grace_analysis_utils.py` | Shared utilities: GRACE/precip processing, aridity maps, correlation maps, subbasin summaries, layout constants (`_MAP_*`). |
 | `grace_timeseries_clustering.py` | Slimmed clustering module; notebook uses `advanced_time_series_clustering` only. |
 | `gw_preprocess.py` | Well preprocessing and GRACE–GWL correlation / maps (see §10). |
-| `notebooks/03_sws_arid_analysis.ipynb` | Surface-water / lake vs GRACE analysis notebook. |
+| `notebooks/02_sws_arid_analysis.ipynb` | Surface-water / lake vs GRACE analysis notebook. |
 | `src/sws_analysis_utils.py` | SWS download, preprocess, and plotting helpers used by that notebook. |
 | `SWS/SWS_REFERENCE.md` | SWS path / data-layout notes. |
 | `CONTEXT_SUMMARY.md` | This handoff file. |
@@ -45,14 +45,14 @@
 
 Functions imported by the two publication notebooks (direct imports). Helpers called only inside these modules are kept transitively and are not listed here.
 
-### `notebooks/02_grace_arid_analysis.ipynb`
+### `notebooks/03_grace_arid_analysis.ipynb`
 
 - **`grace_analysis_pixel`:** `analyze_grace_response_by_pixel`, `analyze_grace_response_by_aquifer_pixel`, `plot_pixel_analysis_maps`, `plot_pixel_epe_grace_relationship`, `plot_pixel_results_distribution_diagnostics`, `plot_event_cluster_distribution_and_relationship`
 - **`grace_analysis_utils`:** `process_grace_data`, `process_predictor_fine`, `plot_aridity_raster`, `plot_arid_watersheds`, `plot_multiple_maps_with_balanced_colorbar`, `calculate_grace_precip_correlation_per_pixel`, `plot_grace_correlation_map`, `summarize_grace_correlation_outputs`, `plot_grace_precip_correlation_interactive_map`, `plot_grace_precip_correlation_temporal`, `plot_grace_precip_extremes`, `plot_timeseries_with_precip`, `plot_subbasin_time_series_all`, `subbasin_trend_analysis`, `add_average_annual_precipitation`, `sort_and_index_by_area`, `analyze_results_comprehensive`, `summarize_results_dict`
 - **`grace_timeseries_clustering`:** `advanced_time_series_clustering`
 - **`gw_preprocess`:** `preprocess_all_countries`, `print_well_info`, `save_groundwater_data`, `plot_all_well_locations`, `correlate_wells_with_grace`, `plot_grace_well_timeseries_comparison`, `plot_correlation_distributions`, `plot_correlation_distributions_by_country`, `plot_grace_gwl_correlation_lag_maps`, `plot_optimal_lag_histograms`
 
-### `notebooks/03_sws_arid_analysis.ipynb`
+### `notebooks/02_sws_arid_analysis.ipynb`
 
 - **`sws_analysis_utils`:** `load_sws_config`, `load_hydrolakes_polygons`, `resolve_precip_path`, `run_download_all`, `build_glolakes_arid_catalog`, `build_glolakes_swsa_batch`, `build_grace_time_range`, `process_grace_mean`, `process_precip_on_grace_grid`, `plot_example_lake_volumes`, `analyze_lake_grace_comparisons`, `plot_lake_grace_precip_comparison`, `load_arid_domains`, `plot_lake_std_ratio_map`, `plot_lake_std_ratio_maps_by_domain`, `export_lake_std_ratio_shapefile`, `plot_filtered_lake_std_comparisons`
 
@@ -145,13 +145,13 @@ When describing WRR methods, tie claims to:
 - **AOI:** Use `aoi_geometry=` for arid polygons, or `aquifer_gdf` + `aquifer_ids` together. Don’t assume `aquifer_gdf` alone clips.
 - **Notebook naming:** Parameters named `aquifer_*` are historical; geometry can be any region.
 - **`grace_std` in outputs:** Time-varying std across solutions ≠ `valid_std_sum` (event-aggregated quadrature).
-- **Publication vs Cursor notebook:** Features present only in the older Cursor notebook (e.g. CRH spatially corrected Spearman test, LSM/soil-moisture cells) were **removed** from this folder because `notebooks/02_grace_arid_analysis.ipynb` does not call them. Do not reintroduce them unless the publication notebook is updated first.
+- **Publication vs Cursor notebook:** Features present only in the older Cursor notebook (e.g. CRH spatially corrected Spearman test, LSM/soil-moisture cells) were **removed** from this folder because `notebooks/03_grace_arid_analysis.ipynb` does not call them. Do not reintroduce them unless the publication notebook is updated first.
 
 ---
 
 ## 10. Secondary context: GRACE–well analysis (`gw_preprocess.py`)
 
-Still used by `notebooks/02_grace_arid_analysis.ipynb` for in-situ groundwater correlation:
+Still used by `notebooks/03_grace_arid_analysis.ipynb` for in-situ groundwater correlation:
 
 - **Key kept functions:** `preprocess_groundwater_data`, `preprocess_all_countries`, `classify_well_depths`, `correlate_wells_with_grace`, `plot_grace_well_timeseries_comparison`, `plot_correlation_distributions`, `plot_correlation_distributions_by_country`, `plot_all_well_locations`, `plot_grace_gwl_correlation_lag_maps`, `plot_optimal_lag_histograms`, `print_well_info`, `save_groundwater_data`.
 - **Depth:** Shallow ≤50 m, Deep >50 m from `avg_depth_m` (where classification is used).
@@ -164,7 +164,7 @@ Still used by `notebooks/02_grace_arid_analysis.ipynb` for in-situ groundwater c
 
 ## 11. Secondary context: SWS / lakes (`SWS/`)
 
-- Notebook: `notebooks/03_sws_arid_analysis.ipynb`.
+- Notebook: `notebooks/02_sws_arid_analysis.ipynb`.
 - Module: `src/sws_analysis_utils.py` (pruned; unused alternate download/parse/plot helpers removed).
 - Typical flow: config → HydroLAKES / GloLakes catalog → SWSA batch → GRACE mean & precip on GRACE grid → lake–GRACE comparisons → std-ratio maps / shapefile export.
 - See `SWS/SWS_REFERENCE.md` for data roots and external sources.
@@ -192,4 +192,4 @@ Still used by `notebooks/02_grace_arid_analysis.ipynb` for in-situ groundwater c
 
 ---
 
-*Last updated: 2026-07-17 — publication folder prune complete; `notebooks/02_grace_arid_analysis.ipynb` + `SWS_arid_analysis.ipynb` are the keep-alive roots. Re-read the modules and notebooks for exact parameter defaults before citing numbers in the paper.*
+*Last updated: 2026-07-17 — publication folder prune complete; `notebooks/03_grace_arid_analysis.ipynb` + `SWS_arid_analysis.ipynb` are the keep-alive roots. Re-read the modules and notebooks for exact parameter defaults before citing numbers in the paper.*

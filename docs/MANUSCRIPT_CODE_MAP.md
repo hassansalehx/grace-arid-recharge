@@ -1,6 +1,6 @@
 # Manuscript ↔ Code Map
 
-**Purpose:** Relate *Hassan & Sultan (2026 draft)* manuscript + supporting information to the publication code in this folder, so each paper figure can be regenerated from `notebooks/02_grace_arid_analysis.ipynb` + the three Python modules.
+**Purpose:** Relate *Hassan & Sultan (2026 draft)* manuscript + supporting information to the publication code in this folder, so each paper figure can be regenerated from `notebooks/03_grace_arid_analysis.ipynb` + the three Python modules.
 
 **Sources reviewed:**
 
@@ -11,7 +11,7 @@
 
 | Path | Role |
 |------|------|
-| [`notebooks/02_grace_arid_analysis.ipynb`](notebooks/02_grace_arid_analysis.ipynb) | End-to-end analysis notebook |
+| [`notebooks/03_grace_arid_analysis.ipynb`](notebooks/03_grace_arid_analysis.ipynb) | End-to-end analysis notebook |
 | [`src/grace_analysis_utils.py`](src/grace_analysis_utils.py) | GRACE/precip processing, aridity & correlation maps |
 | [`grace_analysis_pixel.py`](grace_analysis_pixel.py) | Event-based EPE → storage response + RE maps/scatters |
 | [`gw_preprocess.py`](gw_preprocess.py) | Well QC, GRACE–GWL correlation, well maps |
@@ -207,4 +207,4 @@ Without changing science, add a thin “Paper figures” section (or markdown ta
 
 ---
 
-*Generated 2026-07-17 from manuscript PDFs + `notebooks/02_grace_arid_analysis.ipynb` / module review. Re-check numbers (n=2046, 2347, medians) against a fresh run before camera-ready.*
+*Generated 2026-07-17 from manuscript PDFs + `notebooks/03_grace_arid_analysis.ipynb` / module review. Re-check numbers (n=2046, 2347, medians) against a fresh run before camera-ready.*

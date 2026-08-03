@@ -1,8 +1,14 @@
 """
-GRACE Data Analysis Utility Functions
+GRACE data analysis utilities for arid-region notebooks.
 
-This module contains all utility functions for GRACE data analysis extracted from the Jupyter notebook.
-Functions include data processing, visualization, statistical analysis, and mapping utilities.
+Notebook-facing surface (see ``__all__``): load/process GRACE and predictors,
+TWSA-CPA correlation maps, and shared plotting helpers used by notebook 03.
+
+Residual note:
+  TWSA-CPA correlation uses calendar-locked ``_decompose_grace_calendar``.
+  Pixel EPE/RE analysis in ``grace_analysis_pixel`` currently uses index-based
+  ``decompose_grace_sin_cosin`` after gap years are dropped. Treat those
+  residual products as related but not identical.
 """
 
 import numpy as np
@@ -29,6 +35,29 @@ import cartopy.crs as ccrs
 import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
 from IPython.display import display  # Used in display_comparison_table
+
+__all__ = [
+    "format_pvalue",
+    "process_grace_data",
+    "process_predictor_fine",
+    "plot_aridity_raster",
+    "calculate_grace_precip_correlation_per_pixel",
+    "plot_grace_correlation_map",
+    "summarize_grace_correlation_outputs",
+    "plot_grace_precip_correlation_interactive_map",
+    "decompose_grace_sin_cosin",
+]
+
+
+from status_io import (  # noqa: E402
+    announce as _announce,
+    item as _item,
+    note as _note,
+    raise_ctx as _raise_ctx,
+    rel as _rel,
+    summarize_skipped as _summarize_skipped,
+)
+
 
 def format_pvalue(p_val):
     """
@@ -172,6 +201,58 @@ def _plot_aridity_aoi_boundaries(
     return color_map
 
 
+
+def _ensure_aridity_display_raster(path, max_pixels=1_000_000):
+    """
+    Return a downsampled GeoTIFF suitable for quick map display.
+
+    The source Zomer AI GeoTIFF has no overviews (~485 MB / ~900M cells), so a
+    windowed ``out_shape`` read still scans the full window (~10s on WSL). Build a
+    ~max_pixels display cache once under ``data/interim/aridity/`` and reuse it.
+    """
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.transform import Affine
+
+    path = Path(path)
+    here = Path(__file__).resolve().parent
+    repo = here.parent if here.name == "src" else Path.cwd()
+    cache_dir = repo / "data" / "interim" / "aridity"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir / f"{path.stem}_display.tif"
+    if cache.is_file() and cache.stat().st_size > 0:
+        return str(cache)
+
+    _note(f"building aridity display cache (one-time, ~max_pixels={max_pixels:,})")
+    with rasterio.open(path) as src:
+        total = src.height * src.width
+        if max_pixels and total > max_pixels:
+            scale = np.sqrt(total / float(max_pixels))
+            out_h = max(1, int(round(src.height / scale)))
+            out_w = max(1, int(round(src.width / scale)))
+        else:
+            out_h, out_w = src.height, src.width
+        data = src.read(1, out_shape=(out_h, out_w), resampling=Resampling.nearest)
+        transform = src.transform * Affine.scale(src.width / out_w, src.height / out_h)
+        profile = src.profile.copy()
+        profile.update(
+            height=out_h,
+            width=out_w,
+            transform=transform,
+            compress="lzw",
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+            count=1,
+            dtype=data.dtype,
+        )
+        profile.pop("overviews", None)
+        with rasterio.open(cache, "w", **profile) as dst:
+            dst.write(data, 1)
+    _item(_rel(cache), "ok")
+    return str(cache)
+
+
 def plot_aridity_raster(
     path,
     cmap='viridis',
@@ -211,9 +292,11 @@ def plot_aridity_raster(
     clip_aoi : bool, default True
         If True, clip raster to AOI. If False, full raster is shown (AOI outline only);
         the raster is downsampled to avoid loading a huge array into memory.
-    max_pixels : int, default 4_000_000
-        If the raster has more than this many cells after clipping/selection, it is
-        coarsened (stride) before plotting to prevent Jupyter kernel OOM crashes.
+    max_pixels : int, default 1_000_000
+        Target pixel budget for the displayed array. A one-time display GeoTIFF
+        (~max_pixels) is written under ``data/interim/aridity/`` and reused on
+        later calls. Without that cache, a windowed read of the full-res source
+        (no overviews) is ~10s+ on WSL.
     color_boundaries : bool, default False
         If False, draw a single black outline for the full AOI. If True, draw each
         feature with a distinct color (use GeoDataFrame + ``aoi_boundary_col`` for names).
@@ -222,79 +305,91 @@ def plot_aridity_raster(
         (assigns colors per feature; no legend is drawn).
         Defaults to ``'Domain'`` if that column exists.
     """
-    # Read aridity data using rioxarray for easier clipping
-    aridity_da = rioxarray.open_rasterio(path)
-    
-    # Ensure CRS is set (aridity data is typically in WGS84/EPSG:4326)
-    if not aridity_da.rio.crs:
-        aridity_da.rio.write_crs("EPSG:4326", inplace=True)
-    
-    # Ensure spatial dimensions are set
-    # Check if spatial dims are already set by trying to access x_dim/y_dim
-    try:
-        x_dim = aridity_da.rio.x_dim
-        y_dim = aridity_da.rio.y_dim
-    except AttributeError:
-        # Spatial dimensions not set, detect and set them
-        if 'x' in aridity_da.dims and 'y' in aridity_da.dims:
-            aridity_da.rio.set_spatial_dims(x_dim='x', y_dim='y', inplace=True)
-        elif 'lon' in aridity_da.dims and 'lat' in aridity_da.dims:
-            aridity_da.rio.set_spatial_dims(x_dim='lon', y_dim='lat', inplace=True)
-        else:
-            # Default to x, y if they exist
-            aridity_da.rio.set_spatial_dims(x_dim='x', y_dim='y', inplace=True)
-    
-    # Clip to AOI if provided
+    # The Zomer AI GeoTIFF is ~1 km global (~485 MB / ~900M cells) with no overviews.
+    # Use a one-time display cache (~max_pixels), then window + polygon-mask.
+    path = _ensure_aridity_display_raster(path, max_pixels=max_pixels)
+    import rasterio
+    from rasterio.enums import Resampling
+    from rasterio.windows import from_bounds as _window_from_bounds
+    from rasterio.transform import array_bounds as _array_bounds
+    from rasterio import features as _rio_features
+
+    aoi_gdf = None
     if aoi_geometry is not None:
-        # Convert to GeoDataFrame for clipping
         if isinstance(aoi_geometry, gpd.GeoSeries):
-            aoi_gdf = gpd.GeoDataFrame(geometry=aoi_geometry, crs=aoi_geometry.crs).to_crs(aridity_da.rio.crs)
+            aoi_gdf = gpd.GeoDataFrame(geometry=aoi_geometry, crs=aoi_geometry.crs)
         elif isinstance(aoi_geometry, gpd.GeoDataFrame):
-            aoi_gdf = aoi_geometry.to_crs(aridity_da.rio.crs)
+            aoi_gdf = aoi_geometry.copy()
         else:
-            aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_geometry], crs="EPSG:4326").to_crs(aridity_da.rio.crs)
-        
-        # Clip aridity data to AOI
-        if clip_aoi == True:
-            aridity_da = aridity_da.rio.clip(aoi_gdf.geometry, crs=aridity_da.rio.crs, drop=True)
-        else:
-            aridity_da = aridity_da
-        
-        # Get extent from clipped data (rio.bounds() returns (minx, miny, maxx, maxy))
-        minx, miny, maxx, maxy = aridity_da.rio.bounds()
-        extent = [minx, maxx, miny, maxy]
-    else:
-        # Get extent (rio.bounds() returns (minx, miny, maxx, maxy))
-        minx, miny, maxx, maxy = aridity_da.rio.bounds()
-        extent = [minx, maxx, miny, maxy]
+            aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_geometry], crs="EPSG:4326")
 
-    x_dim = aridity_da.rio.x_dim
-    y_dim = aridity_da.rio.y_dim
-
-    # Get first band if multi-band
-    if 'band' in aridity_da.dims:
-        data_array = aridity_da.isel(band=0)
-    else:
-        data_array = aridity_da
-
-    # Coarsen large rasters before .values (critical when clip_aoi=False on global GeoTIFFs)
-    if x_dim in data_array.dims and y_dim in data_array.dims:
-        nx = int(data_array.sizes[x_dim])
-        ny = int(data_array.sizes[y_dim])
-        total = nx * ny
-        if max_pixels and total > max_pixels:
-            stride = int(np.ceil(np.sqrt(total / float(max_pixels))))
-            stride = max(stride, 1)
-            data_array = data_array.isel(
-                {x_dim: slice(None, None, stride), y_dim: slice(None, None, stride)}
+    with rasterio.open(path) as src:
+        src_crs = src.crs or "EPSG:4326"
+        if aoi_gdf is not None:
+            if aoi_gdf.crs is None:
+                aoi_gdf = aoi_gdf.set_crs(src_crs)
+            else:
+                aoi_gdf = aoi_gdf.to_crs(src_crs)
+            minx, miny, maxx, maxy = aoi_gdf.total_bounds
+            pad = 0.05
+            minx, miny, maxx, maxy = minx - pad, miny - pad, maxx + pad, maxy + pad
+            window = _window_from_bounds(minx, miny, maxx, maxy, transform=src.transform)
+            window = window.round_offsets().round_lengths()
+            win_h = max(int(window.height), 1)
+            win_w = max(int(window.width), 1)
+            total = win_h * win_w
+            if max_pixels and total > max_pixels:
+                scale = np.sqrt(total / float(max_pixels))
+                out_h = max(1, int(round(win_h / scale)))
+                out_w = max(1, int(round(win_w / scale)))
+            else:
+                out_h, out_w = win_h, win_w
+            data = src.read(
+                1,
+                window=window,
+                out_shape=(out_h, out_w),
+                resampling=Resampling.nearest,
+                boundless=True,
+                fill_value=0 if src.nodata is None else src.nodata,
+            ).astype(float)
+            transform = src.window_transform(window) * src.transform.scale(
+                (win_w / out_w) if out_w else 1.0,
+                (win_h / out_h) if out_h else 1.0,
             )
-            # Extent must match the downsampled grid for imshow
-            minx, miny, maxx, maxy = data_array.rio.bounds()
-            extent = [minx, maxx, miny, maxy]
+            nodata = src.nodata
+            minx, miny, maxx, maxy = _array_bounds(out_h, out_w, transform)
+        else:
+            total = src.height * src.width
+            if max_pixels and total > max_pixels:
+                scale = np.sqrt(total / float(max_pixels))
+                out_h = max(1, int(round(src.height / scale)))
+                out_w = max(1, int(round(src.width / scale)))
+            else:
+                out_h, out_w = src.height, src.width
+            data = src.read(
+                1,
+                out_shape=(out_h, out_w),
+                resampling=Resampling.nearest,
+            ).astype(float)
+            transform = src.transform * src.transform.scale(
+                (src.width / out_w) if out_w else 1.0,
+                (src.height / out_h) if out_h else 1.0,
+            )
+            nodata = src.nodata
+            minx, miny, maxx, maxy = _array_bounds(out_h, out_w, transform)
 
-    # Convert to numpy array
-    data = np.asarray(data_array.values, dtype=float)
-    nodata = data_array.rio.nodata
+    extent = [minx, maxx, miny, maxy]
+
+    if aoi_gdf is not None and clip_aoi:
+        poly_mask = _rio_features.rasterize(
+            ((geom, 1) for geom in aoi_gdf.geometry if geom is not None and not geom.is_empty),
+            out_shape=data.shape,
+            transform=transform,
+            fill=0,
+            dtype=np.uint8,
+            all_touched=True,
+        )
+        data = np.where(poly_mask.astype(bool), data, np.nan)
 
     # Mask invalid and 0 values (avoid comparing to nodata when it is None/NaN)
     mask_bad = (data == 0) | (data < 1)
@@ -577,7 +672,6 @@ def calculate_grace_precip_correlation_per_pixel(
     # 2. Clip to AOI
     # ------------------------------------------------------------------
     if aoi_geometry is not None:
-        print("Clipping GRACE and precipitation data to AOI geometry...")
         if isinstance(aoi_geometry, gpd.GeoSeries):
             aoi_gdf = gpd.GeoDataFrame(geometry=aoi_geometry, crs=aoi_geometry.crs).to_crs("EPSG:4326")
         elif isinstance(aoi_geometry, gpd.GeoDataFrame):
@@ -589,19 +683,17 @@ def calculate_grace_precip_correlation_per_pixel(
         try:
             grace_data = grace_data.rio.clip(geom_clip, crs="EPSG:4326", drop=True)
             precip_data = precip_data.rio.clip(geom_clip, crs="EPSG:4326", drop=True)
-            print(f"Clipped to AOI: {len(aoi_gdf)} geometry/ies")
         except Exception as e:
-            print(f"Warning: Clipping failed ({e}). Continuing without clipping.")
+            _note(
+                f"AOI clip failed ({e}); continuing unclipped. "
+                "Hint: ensure DataArray CRS is EPSG:4326 and spatial dims are lon/lat."
+            )
 
     # ------------------------------------------------------------------
     # 3. Coarsen precipitation to GRACE grid
     # ------------------------------------------------------------------
     if ('lat' in precip_data.dims and 'lon' in precip_data.dims
             and 'lat' in grace_data.dims and 'lon' in grace_data.dims):
-        grace_lat_res = abs(float(grace_data.lat[1] - grace_data.lat[0])) if len(grace_data.lat) > 1 else 1.0
-        precip_lat_res = abs(float(precip_data.lat[1] - precip_data.lat[0])) if len(precip_data.lat) > 1 else 1.0
-        if precip_lat_res < grace_lat_res * 0.9:
-            print("Coarsening precipitation data to match GRACE resolution...")
         precip_data = precip_data.interp(lat=grace_data.lat, lon=grace_data.lon, method='nearest')
 
     # ------------------------------------------------------------------
@@ -671,8 +763,6 @@ def calculate_grace_precip_correlation_per_pixel(
             "data after alignment"
         )
 
-    print(f"Using precipitation predictor mode: {_mode}")
-
     # ------------------------------------------------------------------
     # 6. Rechunk for parallel apply_ufunc (time in one chunk; split lat/lon)
     # ------------------------------------------------------------------
@@ -693,8 +783,6 @@ def calculate_grace_precip_correlation_per_pixel(
     time_values = grace_aligned.time.values  # datetime64 array shared by all pixels
 
     if use_residual:
-        print("Decomposing GRACE data to residual (calendar-based harmonic)...")
-
         def _decompose_pixel_calendar(grace_ts_array):
             return _decompose_grace_calendar(grace_ts_array, time_values)
 
@@ -720,9 +808,6 @@ def calculate_grace_precip_correlation_per_pixel(
     # ------------------------------------------------------------------
     # 8. Lag correlation (precip leads GRACE)
     # ------------------------------------------------------------------
-    print(f"Computing lag correlations (max_lag={max_lag_months}, "
-          f"min_common={min_common_dates}, method={corr_method})...")
-
     _max_lag = int(max_lag_months)
     _min_pts = int(min_common_dates)
 
@@ -753,8 +838,6 @@ def calculate_grace_precip_correlation_per_pixel(
     import dask
     all_das = [correlation_da, pvalue_da, lag_da, corr_lag0_da]
     compute_kw = {'scheduler': client} if client is not None else {}
-    if client is not None:
-        print("Computing with dask client...")
     try:
         from dask.diagnostics import ProgressBar
         with ProgressBar():
@@ -765,9 +848,12 @@ def calculate_grace_precip_correlation_per_pixel(
             *all_das, **compute_kw)
 
     n_processed = int(np.sum(~np.isnan(correlation_da.values)))
-    n_total = int(np.prod(correlation_da.shape))
-    print(f"Calculated correlations for {n_processed} out of {n_total} pixels "
-          f"({n_processed / n_total * 100:.1f}%)")
+    grace_label = "residual" if use_residual else "anomaly"
+    method_label = str(corr_method).strip().capitalize()
+    print(
+        f"TWSA-CPA {grace_label}/{_mode}: {n_processed} valid pixels "
+        f"({method_label}, lag {int(max_lag_months)})"
+    )
 
     # ------------------------------------------------------------------
     # 10. Names, CRS, spatial dims
@@ -951,7 +1037,7 @@ def _export_geotiff_dataarray(da, out_path, *, nodata=np.nan):
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(arr, 1)
 
-    print(f"Raster saved: {out_path}")
+    _item(_rel(out_path), "ok")
     return out_path
 
 
@@ -1035,10 +1121,13 @@ def plot_grace_correlation_map(
         colorbar ticks. ``divergent`` and ``cbar_ticks`` are ignored in this
         mode. Negative correlations fall in the lowest class.
     save_raster : bool, default=False
-        If True, export the mapped correlation grid as GeoTIFF under
-        ``saved_rasters_path``.
-    saved_rasters_path : str, default=.../tiff_files
-        Output directory for GeoTIFF exports when ``save_raster=True``.
+        If True, export the continuous correlation grid (ρ) as GeoTIFF under
+        ``saved_rasters_path``. Classification is display-only and is not written
+        into the raster values or filename.
+    saved_rasters_path : str, default="outputs/rasters"
+        Output directory for GeoTIFF exports when ``save_raster=True``. Relative
+        paths are resolved against the repository root (``…/github``), not the
+        process cwd. Prefer ``str(OUTPUT_DIR / "rasters")`` from the notebook.
     raster_tags : list of str, optional
         Extra filename tokens (e.g. ``precip_mode``, ``residual``, ``0lag``).
 
@@ -1360,12 +1449,14 @@ def plot_grace_correlation_map(
         print(f"Correlation map saved to: {save_path}")
 
     if save_raster:
+        # Export continuous correlation (Spearman/Pearson ρ), not map class IDs.
+        # Callers pass analysis tags via raster_tags (e.g. precip_mode, residual/anomaly, 0lag).
+        raster_dir = Path(saved_rasters_path)
+        if not raster_dir.is_absolute():
+            # Resolve relative paths against the repo root (…/github), not the cwd
+            repo_root = Path(__file__).resolve().parent.parent
+            raster_dir = repo_root / raster_dir
         raster_tag_list = list(raster_tags or [])
-        if classify_values:
-            raster_tag_list.append("classified")
-            if classify_thresholds is not None:
-                thr = "_".join(f"{float(t):g}".replace(".", "p") for t in classify_thresholds)
-                raster_tag_list.append(f"thr_{thr}")
         if mask_non_significant:
             raster_tag_list.append("sig_masked")
         label_l = str(label).lower()
@@ -1374,7 +1465,7 @@ def plot_grace_correlation_map(
         elif "pearson" in label_l:
             raster_tag_list.append("pearson")
         raster_out = _compose_raster_output_path(
-            saved_rasters_path,
+            str(raster_dir),
             "grace_precip_correlation",
             raster_tag_list,
         )
@@ -1389,11 +1480,12 @@ def summarize_grace_correlation_outputs(
     pvalue_da,
     lag_da,
     significance_level=0.05,
-    dist_figsize=(13, 4.8),
+    dist_figsize=None,
     show_stats_box=True,
     stats_box_fields=('median', 'q05', 'q95'),
     significant_only=False,
     hist_use_map_cmap=False,
+    show_lag_panel=True,
     correlation_ylim_max=None,
     lag_ylim_max=None,
     dpi=300,
@@ -1416,8 +1508,9 @@ def summarize_grace_correlation_outputs(
         Pixelwise optimal lag (months).
     significance_level : float, default=0.05
         Significance threshold used for summary counts.
-    dist_figsize : tuple, default=(13, 3.6)
-        Figure size for the distribution figure.
+    dist_figsize : tuple, optional
+        Figure size. Defaults to ``(13, 4.8)`` with lag panel, ``(6.5, 4.8)``
+        without.
     show_stats_box : bool, default=True
         If True, draw per-histogram summary box.
     stats_box_fields : tuple, default=('median', 'q05', 'q95')
@@ -1429,6 +1522,8 @@ def summarize_grace_correlation_outputs(
     hist_use_map_cmap : bool, default=False
         If True, histogram bars use map-matched colormaps:
         correlation uses ``RdBu`` over [-1, 1], lag uses ``viridis_r`` over [0, 12].
+    show_lag_panel : bool, default=True
+        If False, plot only the correlation histogram.
     correlation_ylim_max : float, optional
         Optional upper y-limit for the correlation histogram (grid-cell count axis).
     lag_ylim_max : float, optional
@@ -1591,13 +1686,21 @@ def summarize_grace_correlation_outputs(
             corr_vals, np.linspace(-1, 1, 31), "#3b82f6", r"Spearman $\rho$", 'correlation',
             'RdBu', mcolors.TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
         ),
-        (
-            lag_vals, np.arange(-0.5, 13.5, 1.0), "#10b981", "Optimal lag (months)", 'lag_months',
-            'viridis_r', mcolors.Normalize(vmin=0, vmax=12)
-        ),
     ]
+    if show_lag_panel:
+        dist_specs.append(
+            (
+                lag_vals, np.arange(-0.5, 13.5, 1.0), "#10b981", "Optimal lag (months)", 'lag_months',
+                'viridis_r', mcolors.Normalize(vmin=0, vmax=12)
+            )
+        )
 
-    fig_dist, axd = plt.subplots(1, 2, figsize=dist_figsize)
+    n_panels = len(dist_specs)
+    if dist_figsize is None:
+        dist_figsize = (13, 4.8) if n_panels > 1 else (6.5, 4.8)
+    fig_dist, axd = plt.subplots(1, n_panels, figsize=dist_figsize)
+    if n_panels == 1:
+        axd = [axd]
     for idx, (ax, ds) in enumerate(zip(axd, dist_specs)):
         vals, bins, color, title, metric_key, cmap_name, cmap_norm = ds
         _plot_single_hist(
@@ -1732,8 +1835,11 @@ def _prepare_grace_precip_correlation_inputs(
         try:
             grace_data = grace_data.rio.clip(geom_clip, crs="EPSG:4326", drop=True)
             precip_data = precip_data.rio.clip(geom_clip, crs="EPSG:4326", drop=True)
-        except Exception:
-            pass
+        except Exception as e:
+            _note(
+                f"AOI clip failed ({e}); continuing unclipped. "
+                "Hint: ensure DataArray CRS is EPSG:4326 and spatial dims are lon/lat."
+            )
 
     if ('lat' in precip_data.dims and 'lon' in precip_data.dims
             and 'lat' in grace_data.dims and 'lon' in grace_data.dims):
@@ -2516,8 +2622,19 @@ def process_grace_data(grace_file, aoi_geometry, time_range,
     xr.DataArray
         Processed GRACE data
     """
+    grace_path = Path(grace_file)
+    if not grace_path.is_file():
+        _raise_ctx(FileNotFoundError, f"GRACE file not found: {_rel(grace_file)}")
+    _note(f"GRACE: {_rel(grace_file)}")
     # Load GRACE dataset
     grace_data = xr.open_dataset(grace_file)
+    if variable_name not in grace_data:
+        available = list(grace_data.data_vars)
+        _raise_ctx(
+            KeyError,
+            f"Variable {variable_name!r} not in GRACE dataset {_rel(grace_file)}. "
+            f"Available: {available}",
+        )
 
     # Fix Time Format (Handles both "Units" and "units")
     time_attrs = grace_data['time'].attrs
@@ -2555,15 +2672,15 @@ def process_grace_data(grace_file, aoi_geometry, time_range,
     # Try to load land mask from separate file (e.g., CSR)
     if land_mask_file is not None:
         try:
-            print(f"Loading land mask from separate file: {land_mask_file}")
+            _note(f"land mask: {_rel(land_mask_file)}")
             land_mask_data = xr.open_dataset(land_mask_file)
             # Check for different possible land mask variable names
             if 'LO_val' in land_mask_data:  # CSR land mask variable
                 land_mask = land_mask_data['LO_val']
-                print(f"  Found land mask variable: 'LO_val'")
+                _note("found land mask variable: LO_val")
             elif 'land_mask' in land_mask_data:
                 land_mask = land_mask_data['land_mask']
-                print(f"  Found land mask variable: 'land_mask'")
+                _note("found land mask variable: land_mask")
             else:
                 print(f"  Warning: Land mask variable not found. Available variables: {list(land_mask_data.data_vars)}")
         except Exception as e:
@@ -2591,6 +2708,14 @@ def process_grace_data(grace_file, aoi_geometry, time_range,
     # Ensure latitude and longitude are evenly spaced before coarsening
     grace_lwe = grace_lwe.sortby("lat")  # Ensure lat is sorted in increasing order    
     grace_lwe = grace_lwe.sortby("lon")  # Ensure lon is sorted in increasing order    
+
+    n_lat, n_lon = len(grace_lwe.lat), len(grace_lwe.lon)
+    if n_lat < 2 or n_lon < 2:
+        _raise_ctx(
+            ValueError,
+            f"GRACE lat/lon must have length >= 2 to estimate resolution "
+            f"(got lat={n_lat}, lon={n_lon})",
+        )
 
     # Determine spatial resolution (difference between consecutive lat/lon values)
     delta_lat = np.abs(grace_lwe.lat.values[1] - grace_lwe.lat.values[0])
@@ -2678,8 +2803,16 @@ def process_grace_data(grace_file, aoi_geometry, time_range,
     grace_lwe_scaled.rio.write_crs("EPSG:4326", inplace=True)
     grace_lwe_scaled.rio.set_spatial_dims(x_dim="lon", y_dim="lat", inplace=True)
 
-    # Clip GRACE data to the AOI region
-    grace_clipped = grace_lwe_scaled.rio.clip(aoi_geometry, crs="EPSG:4326", drop=True)
+    # Clip GRACE data to the AOI region (failures still raise; clearer context)
+    try:
+        grace_clipped = grace_lwe_scaled.rio.clip(aoi_geometry, crs="EPSG:4326", drop=True)
+    except Exception as e:
+        _raise_ctx(
+            ValueError,
+            f"Failed to clip GRACE to AOI ({e}). "
+            "Hint: ensure CRS is EPSG:4326 and spatial dims are lon/lat.",
+            cause=e,
+        )
     grace_clipped.rio.write_crs("EPSG:4326", inplace=True)
 
     # Interpolate to regular monthly intervals
@@ -2765,6 +2898,13 @@ def plot_timeseries_with_precip(
 
 def process_predictor_fine(precip_fine, data_path, variable_name, aoi_geometry, time_range, exclude_years=[2017, 2018]):
     """Process fine-resolution predictor data (e.g., precipitation)."""
+    if exclude_years is not None and len(exclude_years) > 0:
+        if not getattr(process_predictor_fine, "_exclude_years_noted", False):
+            _note(
+                "process_predictor_fine: exclude_years is currently unused "
+                f"(received {list(exclude_years)}); years are not filtered here"
+            )
+            process_predictor_fine._exclude_years_noted = True
     # Load data lazily
     data = xr.open_dataset(data_path, engine="zarr", chunks={})  # no eager chunks
 
@@ -2808,6 +2948,7 @@ def subbasin_trend_analysis(dataarrays, labels, gdf, id_column="subbasin_id"):
 
     for da, label in zip(dataarrays, labels):
         trend_list = []
+        n_failed = 0
 
         # OPTIMIZED: Use enumerate with geometry iterator instead of iterrows()
         for idx, geom in enumerate(tqdm(gdf.geometry, desc=f"Processing {label}", total=len(gdf))):
@@ -2824,8 +2965,11 @@ def subbasin_trend_analysis(dataarrays, labels, gdf, id_column="subbasin_id"):
 
                 trend_list.append(trend)
 
-            except Exception as e:
+            except Exception:
+                n_failed += 1
                 trend_list.append(np.nan)
+
+        _summarize_skipped(f"{label} subbasin trends", n_failed, len(gdf))
 
         # Add trend column to GeoDataFrame
         gdf[f"{label}_trend"] = trend_list
@@ -2840,6 +2984,7 @@ def add_average_annual_precipitation(gdf, rainfall_da, date_dim="time", id_col="
     rainfall_da.rio.write_crs("EPSG:4326", inplace=True).persist()  # Ensure CRS is set
 
     avg_annual_precip_list = []
+    n_failed = 0
 
     # OPTIMIZED: Use itertuples() instead of iterrows() for 10-50x speedup
     for row in tqdm(gdf.itertuples(), total=len(gdf), desc="Calculating Annual Precipitation"):
@@ -2858,10 +3003,12 @@ def add_average_annual_precipitation(gdf, rainfall_da, date_dim="time", id_col="
             annual_sum = df.resample("YE").sum()
             avg_annual_precip = annual_sum.mean().values[0]  # Average annual precipitation (mm/year)
         except Exception:
+            n_failed += 1
             avg_annual_precip = np.nan
 
         avg_annual_precip_list.append(avg_annual_precip)
 
+    _summarize_skipped("avg annual precip features", n_failed, len(gdf))
     gdf[new_col] = avg_annual_precip_list
     return gdf
 
@@ -3119,9 +3266,28 @@ def plot_subbasin_time_series_all(
 
 
 def decompose_grace_sin_cosin(grace_ts, time):
-    """Decompose GRACE time series into trend, seasonal, and residual components."""
+    """Decompose GRACE time series into trend, seasonal, and residual components.
+
+    Returns three 1-D arrays (trend, season, residual) whose length matches the
+    series after ``dropna()`` — the same convention as successful OLS fits.
+    When too few points remain for a stable 6-parameter fit (<12, mirroring
+    ``_decompose_grace_calendar``), returns NaN arrays of that length.
+    """
     ts = grace_ts.to_pandas().dropna()
-    t = np.arange(len(ts))  # time index (0..N-1)
+    n = len(ts)
+    # Intercept + trend + annual sin/cos + semi-annual sin/cos (=6 params);
+    # mirror calendar residual path which requires >=12 valid points.
+    if n < 12:
+        if not getattr(decompose_grace_sin_cosin, "_short_noted", False):
+            _note(
+                f"decompose_grace_sin_cosin: series too short for OLS "
+                f"({n} points after dropna; need >=12); returning NaN components"
+            )
+            decompose_grace_sin_cosin._short_noted = True
+        nan = np.full(n, np.nan, dtype=float)
+        return nan, nan, nan
+
+    t = np.arange(n)  # time index (0..N-1)
     
     X = pd.DataFrame({
         "trend": t,

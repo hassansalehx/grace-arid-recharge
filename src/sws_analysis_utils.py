@@ -1,7 +1,23 @@
 """
 Surface Water Storage (SWS) analysis utilities for arid regions.
 
-Download, preprocess, and plot lake/reservoir storage anomalies comparable to GRACE TWSA.
+Products:
+  HydroLAKES polygons + GloLakes absolute ICESat-2 storage (v1.0 paper path).
+  Compare lake volume anomalies with GRACE TWSA (CSR/JPL/GSFC mean).
+
+Windows / units:
+  Analysis 2004-04-01 to 2025-09-30; baseline 2004-2009 mean removed.
+  Lake volume anomalies in km3; GRACE-window comparison in cm water equivalent.
+  Time index is month-end (freq="ME").
+
+FORCE vs cache:
+  force=True on downloads deletes/replaces complete local HydroLAKES/GloLakes files.
+  Incomplete files (size < remote Content-Length) are unlinked and re-fetched.
+  FORCE_REBUILD / force_rebuild rebuilds the SWSA batch cache under processed/.
+
+Resources:
+  CPU thread pools for download and lake-batch work (DOWNLOAD_THREADS,
+  N_PROCESS_WORKERS). GPU is unused (pandas/xarray/matplotlib batch).
 """
 
 from __future__ import annotations
@@ -51,10 +67,44 @@ try:
 except ImportError:
     _tqdm = None
 
+__all__ = [
+    "SWSConfig",
+    "get_resource_config",
+    "load_sws_config",
+    "resolve_precip_path",
+    "run_download_all",
+    "build_glolakes_arid_catalog",
+    "build_glolakes_swsa_batch",
+    "build_grace_time_range",
+    "process_grace_mean",
+    "process_precip_on_grace_grid",
+    "analyze_lake_grace_comparisons",
+    "save_lake_grace_comparison_figures",
+    "load_arid_domains",
+    "plot_lake_std_ratio_map",
+    "export_lake_std_ratio_shapefile",
+    "clean_lake_std_ratio_table",
+    "export_lake_std_ratio_table",
+    "remove_hydrolakes_raw",
+]
+
+_RESOURCES_ANNOUNCED = False
+
+from status_io import (  # noqa: E402
+    announce as _announce,
+    detect_repo_root as _detect_repo_root,
+    format_batch_failures as _format_batch_failures,
+    item as _item,
+    note as _note,
+    raise_ctx as _raise_ctx,
+    rel as _rel,
+    summarize_skipped as _summarize_skipped,
+)
+
 
 def _dl_note(msg: str) -> None:
-    """User-facing download status line (notebook-friendly)."""
-    print(msg, flush=True)
+    """Backward-compatible status print; prefer ``_announce`` / ``_note`` / ``_item``."""
+    _announce(msg)
 
 
 def _parse_env_file(path: Union[str, Path]) -> None:
@@ -104,15 +154,7 @@ _MAP_AOI_LINEWIDTH = 0.5
 
 def _repo_root() -> Path:
     """Repository root (parent of ``src/``), with cwd fallback for notebooks."""
-    here = Path(__file__).resolve().parent
-    if here.name == "src":
-        return here.parent
-    cwd = Path.cwd().resolve()
-    if (cwd / "src").is_dir():
-        return cwd
-    if (cwd.parent / "src").is_dir():
-        return cwd.parent
-    return cwd
+    return _detect_repo_root()
 
 
 _REPO_ROOT = _repo_root()
@@ -123,59 +165,58 @@ _PROCESSED = _DATA / "processed"
 
 DEFAULT_ARID_AREAS_PATH = str(_PROCESSED / "boundaries" / "ai_v3_yr_mask_02_pol.shp")
 DEFAULT_PRECIP_PATH = str(
-    _INTERIM / "gpm" / "GPM_3IMERGDF_Jan1998_Sep2025_resToM.zarr"
+    _INTERIM / "gpm" / "GPM_3IMERGDF_Jan2002_Sep2025_resToM.zarr"
 )
-DEFAULT_PRECIP_FALLBACK = str(
-    _INTERIM / "gpm" / "GPM_3IMERGDF_Jan1998_Jun2024_resToM.zarr"
-)
-DEFAULT_CSR_GRACE_PATH = str(
-    _RAW / "grace" / "csr" / "CSR_GRACE_GRACE-FO_RL0603_Mascons_all-corrections.nc"
-)
-DEFAULT_JPL_GRACE_PATH = str(
-    _RAW / "grace" / "jpl" / "GRCTellus.JPL.200204_202603.GLO.RL06.3M.MSCNv04CRI.nc"
-)
-DEFAULT_GSFC_GRACE_PATH = str(
-    _RAW
-    / "grace"
-    / "gsfc"
-    / "gsfc.glb_.200204_202511_rl06v2.0_obp-ice6gd_halfdegree.nc"
-)
-DEFAULT_CSR_MASK_PATH = str(
-    _RAW / "grace" / "csr" / "CSR_GRACE_GRACE-FO_RL06_Mascons_v02_LandMask.nc"
-)
+
+
+_GRACE_PLACEHOLDER_NOTED = False
+
+
+def _default_grace_path(key: str) -> Path:
+    """Resolve GRACE paths by stable filename tokens when files exist."""
+    try:
+        from download_data import resolve_grace_paths
+
+        return resolve_grace_paths(_RAW)[key]
+    except Exception:
+        # Placeholders until notebook 01 has downloaded mascons
+        global _GRACE_PLACEHOLDER_NOTED
+        if not _GRACE_PLACEHOLDER_NOTED:
+            _note(
+                "GRACE mascons missing; run notebook 01 or download_grace_mascons() "
+                "(using placeholder paths)"
+            )
+            _GRACE_PLACEHOLDER_NOTED = True
+        placeholders = {
+            "csr": _RAW / "grace" / "csr" / "CSR_GRACE_GRACE-FO_RL0603_Mascons_all-corrections.nc",
+            "jpl": _RAW / "grace" / "jpl" / "GRCTellus.JPL.MSCNv04CRI.nc",
+            "gsfc": _RAW / "grace" / "gsfc" / "gsfc_obp_halfdegree.nc",
+            "csr_mask": _RAW / "grace" / "csr" / "CSR_GRACE_GRACE-FO_RL06_Mascons_v02_LandMask.nc",
+        }
+        return placeholders[key]
+
+
+DEFAULT_CSR_GRACE_PATH = str(_default_grace_path("csr"))
+DEFAULT_JPL_GRACE_PATH = str(_default_grace_path("jpl"))
+DEFAULT_GSFC_GRACE_PATH = str(_default_grace_path("gsfc"))
+DEFAULT_CSR_MASK_PATH = str(_default_grace_path("csr_mask"))
 DEFAULT_GRACE_TIME_START = "2002-08-01"
 # SWS workspace under data/raw/sws/ (raw/, processed/, catalog/, shapefiles/, figures/)
 DEFAULT_DATA_ROOT = _RAW / "sws"
 DEFAULT_REFERENCE_MD = _REPO_ROOT / "docs" / "SWS_REFERENCE.md"
 
-GLOLAKES_THREDDS_CATALOG = (
-    "https://thredds.nci.org.au/thredds/catalog/catalogs/ub8/global/GloLakes/GloLakes.html"
-)
 GLOLAKES_FILE_SERVER = (
     "https://thredds.nci.org.au/thredds/fileServer/ub8/global/GloLakes"
 )
+# Paper pipeline uses GloLakes absolute ICESat-2 storage only.
 GLOLAKES_V10_FILES = {
-    "absolute_grealm": "GloLakes_v1.0/Global_Lake_Absolute_Storage_LandsatPlusGREALM (1984-present).nc",
     "absolute_icesat2": "GloLakes_v1.0/Global_Lake_Absolute_Storage_LandsatPlusICESat2 (1984-present).nc",
-    "absolute_s2": "GloLakes_v1.0/Global_Lake_Absolute_Storage_LandsatPlusSentinel2 (1984-present).nc",
-    "relative_grealm": "GloLakes_v1.0/Global_Lake_Relative_Storage_LandsatPlusGREALM (1993-present).nc",
-    "relative_icesat2": "GloLakes_v1.0/Global_Lake_Relative_Storage_LandsatPlusICESat2 (2018-present).nc",
-    "relative_s2": "GloLakes_v1.0/Global_Lake_Relative_Storage_Sentinel2PlusICESat2 (2018-present).nc",
 }
 GLOLAKES_V11_FILES = {
-    "absolute_grealm": "GloLakes_v1.1/Global_Lake_Absolute_Storage_LandsatPlusGREALM_(1984-present).nc",
     "absolute_icesat2": "GloLakes_v1.1/Global_Lake_Absolute_Storage_LandsatPlusICESat2_(1984-present).nc",
 }
 
 HYDROLAKES_URL = "https://data.hydrosheds.org/file/hydrolakes/HydroLAKES_polys_v10_shp.zip"
-DAHITI_API_BASE = "https://dahiti.dgfi.tum.de/api/v2"
-RECOG_PANGAEA_DOI = "10.1594/PANGAEA.921851"
-RECOG_PANGAEA_URLS = [
-    f"https://doi.pangaea.de/{RECOG_PANGAEA_DOI}?format=zip",
-    f"https://download.pangaea.de/{RECOG_PANGAEA_DOI}",
-]
-
-HYDROWEB_COLLECTIONS = ("HYDROWEB_LAKES_OPE", "HYDROWEB_LAKES_RESEARCH")
 
 
 @dataclass
@@ -196,8 +237,6 @@ class SWSConfig:
     baseline_end: str = BASELINE_END
     analysis_start: str = ANALYSIS_START
     analysis_end: str = ANALYSIS_END
-    dahiti_api_key: Optional[str] = None
-    hydroweb_api_key: Optional[str] = None
     n_download_workers: int = 8
     n_process_workers: int = 16  # thread workers for lake batch / summaries; 1 = serial debug
 
@@ -226,6 +265,79 @@ class SWSConfig:
             d.mkdir(parents=True, exist_ok=True)
 
 
+def get_resource_config() -> Dict[str, Any]:
+    """
+    Return download / process worker defaults from local CPU resources.
+
+    Environment overrides:
+      DOWNLOAD_THREADS, N_PROCESS_WORKERS
+
+    GPU may be reported as ``detected_unused``; the SWS lake batch is
+    pandas/xarray/matplotlib and does not use the GPU.
+    """
+    cpus = os.cpu_count() or 4
+
+    def _env_int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or str(raw).strip() == "":
+            return default
+        try:
+            return int(raw)
+        except ValueError as exc:
+            _raise_ctx(
+                ValueError,
+                f"Invalid {name}={raw!r}; expected an integer "
+                f"(e.g. export {name}={default})",
+                cause=exc,
+            )
+            raise  # pragma: no cover
+
+    download_workers = _env_int(
+        "DOWNLOAD_THREADS", min(16, max(2, cpus - 1))
+    )
+    process_workers = _env_int(
+        "N_PROCESS_WORKERS", min(16, max(2, cpus - 1))
+    )
+
+    gpu = "unavailable"
+    gpu_note = "lake batch is pandas/xarray/matplotlib; CPU threads only"
+    try:
+        import cupy  # noqa: F401
+
+        gpu = "detected_unused"
+    except Exception:
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                gpu = "detected_unused"
+        except Exception:
+            pass
+
+    return {
+        "cpus": cpus,
+        "download_workers": download_workers,
+        "download_threads": download_workers,  # alias
+        "process_workers": process_workers,
+        "n_process_workers": process_workers,  # alias
+        "gpu": gpu,
+        "gpu_note": gpu_note,
+    }
+
+
+def _announce_resources(cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    global _RESOURCES_ANNOUNCED
+    cfg = cfg or get_resource_config()
+    if not _RESOURCES_ANNOUNCED:
+        _announce(
+            f"resources: download_workers={cfg['download_workers']}  "
+            f"process_workers={cfg['process_workers']}  "
+            f"gpu={cfg['gpu']} ({cfg['gpu_note']})"
+        )
+        _RESOURCES_ANNOUNCED = True
+    return cfg
+
+
 def load_sws_config(env_path: Optional[Union[str, Path]] = None) -> SWSConfig:
     """Load configuration and API keys from environment / .env file."""
     module_dir = Path(__file__).resolve().parent
@@ -246,36 +358,46 @@ def load_sws_config(env_path: Optional[Union[str, Path]] = None) -> SWSConfig:
         # Allow config load before notebook 01 has produced the Zarr
         precip = DEFAULT_PRECIP_PATH
         logger.warning("Precipitation Zarr not found yet; using default path: %s", precip)
-    n_process_workers = os.getenv("N_PROCESS_WORKERS")
+    res = get_resource_config()
     cfg = SWSConfig(
         precip_path=Path(precip),
-        dahiti_api_key=os.getenv("DAHITI_API_KEY"),
-        hydroweb_api_key=os.getenv("HYDROWEB_API_KEY"),
-        n_process_workers=int(n_process_workers) if n_process_workers else 16,
+        n_download_workers=int(res["download_workers"]),
+        n_process_workers=int(res["process_workers"]),
     )
     cfg.ensure_dirs()
     return cfg
 
 
 def resolve_precip_path(preferred: Optional[str] = None, fallback: Optional[str] = None) -> str:
-    """Return existing GPM Zarr path, preferring Sep2025 then Jun2024."""
+    """Return an existing monthly GPM IMERG Zarr path (preferred, else fallback or scan)."""
     preferred = preferred or DEFAULT_PRECIP_PATH
-    fallback = fallback or DEFAULT_PRECIP_FALLBACK
     if Path(preferred).exists():
         logger.info("Using precipitation Zarr: %s", preferred)
         return preferred
-    if Path(fallback).exists():
-        logger.warning(
-            "Preferred precip path not found (%s). Using fallback: %s",
-            preferred,
-            fallback,
-        )
-        update_reference_md(
-            "Known issues log",
-            f"- {datetime.utcnow().isoformat()}Z: GPM Sep2025 Zarr missing; using Jun2024 fallback.",
-        )
-        return fallback
-    raise FileNotFoundError(f"No precipitation Zarr found at {preferred} or {fallback}")
+
+    candidates: List[Path] = []
+    if fallback:
+        candidates.append(Path(fallback))
+    gpm_dir = _INTERIM / "gpm"
+    if gpm_dir.is_dir():
+        candidates.extend(sorted(gpm_dir.glob("*_resToM.zarr"), key=lambda p: p.stat().st_mtime, reverse=True))
+
+    for cand in candidates:
+        if cand.exists() and cand.resolve() != Path(preferred).resolve():
+            logger.warning(
+                "Preferred precip path not found (%s). Using fallback: %s",
+                preferred,
+                cand,
+            )
+            update_reference_md(
+                "Known issues log",
+                f"- {datetime.utcnow().isoformat()}Z: preferred GPM Zarr missing; using fallback {cand}.",
+            )
+            return str(cand)
+    raise FileNotFoundError(
+        f"No precipitation Zarr found at {preferred}"
+        + (f" or {fallback}" if fallback else f" (also scanned {_rel(gpm_dir)}/*_resToM.zarr)")
+    )
 
 
 def update_reference_md(section: str, content: str, reference_path: Optional[Path] = None) -> None:
@@ -305,28 +427,40 @@ def _download_file_url(
     chunk_size: int = 1024 * 1024,
     desc: Optional[str] = None,
     expected_size: Optional[int] = None,
+    force: bool = False,
 ) -> Path:
-    """Download a file with retries; skip if dest exists and size matches expected."""
+    """
+    Download a file with retries.
+
+    Resume policy:
+      - Complete local file (size matches remote Content-Length when known) is
+        reused unless ``force=True``.
+      - Incomplete local file (size < expected) is unlinked, then fully re-fetched.
+      - ``force=True`` deletes a complete local file and re-downloads.
+    """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     if expected_size is None:
         expected_size = _remote_content_length(url, timeout=min(timeout, 120))
+
     if dest.exists() and dest.stat().st_size > 0:
         local_size = dest.stat().st_size
-        if expected_size and local_size < expected_size:
-            _dl_note(
-                f"  incomplete {desc or dest.name} "
-                f"({local_size / 1e6:.1f} / {expected_size / 1e6:.1f} MB) — re-downloading"
+        complete = (not expected_size) or local_size >= expected_size
+        if force:
+            _note(f"force re-download {desc or dest.name}")
+            dest.unlink()
+        elif expected_size and local_size < expected_size:
+            _note(
+                f"incomplete {desc or dest.name} "
+                f"({local_size / 1e6:.1f} / {expected_size / 1e6:.1f} MB); re-downloading"
             )
             dest.unlink()
-        else:
-            if desc:
-                size_mb = local_size / (1024 * 1024)
-                _dl_note(f"  ✓ cached {desc} ({size_mb:.0f} MB)")
+        elif complete:
+            _item(desc or dest.name, "ok")
             return dest
 
     if desc:
-        _dl_note(f"  ↓ {desc}")
+        _note(f"downloading {desc}")
 
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
@@ -362,6 +496,7 @@ def _download_file_url(
                 raise RuntimeError(
                     f"Download incomplete for {dest.name}: {written} of {total} bytes"
                 )
+            _item(desc or dest.name, "ok")
             return dest
         except Exception as exc:
             last_err = exc
@@ -388,21 +523,25 @@ def _parallel_map(
     max_workers: int = 8,
     desc: str = "tasks",
 ) -> List[Any]:
-    """Run func(item) in a thread pool; preserve order is not guaranteed."""
+    """Run func(item) in a thread pool; raise if any item fails."""
     if not items:
         return []
     results: List[Any] = []
+    errors: List[Tuple[Any, Exception]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(func, item): item for item in items}
         iterator = as_completed(futures)
         if _tqdm is not None and len(items) > 1:
             iterator = _tqdm(iterator, total=len(items), desc=f"  {desc}", unit="file")
         for fut in iterator:
+            item = futures[fut]
             try:
                 results.append(fut.result())
             except Exception as exc:
-                item = futures[fut]
                 logger.error("%s failed for %s: %s", desc, item, exc)
+                errors.append((item, exc))
+    if errors:
+        raise RuntimeError(_format_batch_failures(desc, errors, len(items)))
     return results
 
 
@@ -512,7 +651,7 @@ def load_hydrolakes_polygons(
     cache = _hydrolakes_polygon_cache_path(cfg)
     if not cache.exists() or cache.stat().st_size == 0:
         shp = download_hydrolakes(cfg)
-        _dl_note("  building HydroLAKES polygon cache (one-time, several minutes)…")
+        _note("building HydroLAKES polygon cache (one-time, several minutes)")
         gdf = gpd.read_file(shp)
         rename = {
             "Hylak_id": "lake_id",
@@ -545,16 +684,25 @@ def download_hydrolakes(cfg: Optional[SWSConfig] = None, force: bool = False) ->
     if not force and extract_dir.exists():
         existing = list(extract_dir.rglob("HydroLAKES_polys_v10.shp"))
         if existing and zip_path.exists():
-            if not remote_size or zip_path.stat().st_size == remote_size:
-                _dl_note(f"  ✓ HydroLAKES shapefile already extracted ({existing[0].parent})")
+            if not remote_size or zip_path.stat().st_size >= remote_size:
+                _item(_rel(existing[0]), "ok")
                 return existing[0]
-            _dl_note("  incomplete HydroLAKES zip — re-downloading")
+            _note("incomplete HydroLAKES zip; re-downloading")
             zip_path.unlink(missing_ok=True)
 
+    if force and zip_path.exists():
+        zip_path.unlink(missing_ok=True)
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir, ignore_errors=True)
+
     _download_file_url(
-        HYDROLAKES_URL, zip_path, desc="HydroLAKES zip", expected_size=remote_size,
+        HYDROLAKES_URL,
+        zip_path,
+        desc="HydroLAKES zip",
+        expected_size=remote_size,
+        force=force,
     )
-    _dl_note("  extracting HydroLAKES archive …")
+    _note("extracting HydroLAKES archive")
     extract_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as zf:
         zf.extractall(extract_dir)
@@ -565,14 +713,108 @@ def download_hydrolakes(cfg: Optional[SWSConfig] = None, force: bool = False) ->
     if not shp_candidates:
         raise FileNotFoundError(f"No HydroLAKES shapefile found under {extract_dir}")
     shp_path = shp_candidates[0]
+    _item(_rel(shp_path), "ok")
     update_reference_md("Known issues log", f"HydroLAKES downloaded to {shp_path.parent}")
     return shp_path
+
+
+def _dir_size_bytes(path: Path) -> int:
+    """Total size of files under ``path`` (0 if missing)."""
+    if not path.exists():
+        return 0
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def remove_hydrolakes_raw(cfg: Optional[SWSConfig] = None) -> Dict[str, Any]:
+    """
+    Delete raw HydroLAKES zip/shapefile after the polygon parquet cache is verified.
+
+    Opt-in disk cleanup: ``hydrolakes_polygons.parquet`` is the analysis product.
+    Raises if the cache is missing, empty, or unreadable. Re-run
+    ``download_hydrolakes(force=True)`` later if you need the shapefile again.
+    """
+    cfg = cfg or load_sws_config()
+    cache = _hydrolakes_polygon_cache_path(cfg)
+    if not cache.exists() or cache.stat().st_size <= 0:
+        raise FileNotFoundError(
+            f"HydroLAKES polygon cache missing or empty: {_rel(cache)}. "
+            "Build it via load_hydrolakes_polygons() / catalog steps before cleanup."
+        )
+    try:
+        probe = gpd.read_parquet(cache)
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"HydroLAKES polygon cache unreadable: {_rel(cache)}. "
+            f"Rebuild before cleanup. Original error: {exc}"
+        ) from exc
+    if probe.empty:
+        raise FileNotFoundError(
+            f"HydroLAKES polygon cache is empty: {_rel(cache)}. "
+            "Rebuild before cleanup."
+        )
+
+    zip_path = cfg.raw_dir / "hydrolakes" / "HydroLAKES_polys_v10_shp.zip"
+    extract_dir = cfg.raw_dir / "hydrolakes" / "HydroLAKES_polys_v10_shp"
+    freed = 0
+    n_removed = 0
+    if zip_path.exists():
+        try:
+            freed += zip_path.stat().st_size
+            zip_path.unlink()
+            n_removed += 1
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Could not remove %s: %s", zip_path, exc)
+    if extract_dir.exists():
+        freed += _dir_size_bytes(extract_dir)
+        shutil.rmtree(extract_dir, ignore_errors=True)
+        n_removed += 1
+    freed_gb = freed / 1e9
+    _item(
+        f"removed HydroLAKES raw ({n_removed} path(s), {freed_gb:.1f} GB); "
+        f"kept {_rel(cache)}",
+        "ok",
+    )
+    return {"n_removed": n_removed, "freed_gb": float(freed_gb)}
+
+
+def _read_shapefile(path: Union[str, Path]) -> gpd.GeoDataFrame:
+    """Read a shapefile; restore a missing ``.shx`` index when GDAL can rebuild it."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Shapefile not found: {_rel(path)}. "
+            "Place arid-mask files under data/processed/boundaries/ (see data/README.md)."
+        )
+    # Incomplete copies often omit .shx; GDAL can rebuild it from .shp
+    prev = os.environ.get("SHAPE_RESTORE_SHX")
+    os.environ["SHAPE_RESTORE_SHX"] = "YES"
+    try:
+        return gpd.read_file(path)
+    except Exception as exc:
+        shx = path.with_suffix(".shx")
+        raise RuntimeError(
+            f"Unable to open {_rel(path)} "
+            f"(sidecar .shx {'missing' if not shx.exists() else 'present'}). "
+            f"Ensure .shp/.shx/.dbf/.prj are together. Original error: {exc}"
+        ) from exc
+    finally:
+        if prev is None:
+            os.environ.pop("SHAPE_RESTORE_SHX", None)
+        else:
+            os.environ["SHAPE_RESTORE_SHX"] = prev
 
 
 def load_arid_mask(path: Optional[Union[str, Path]] = None) -> gpd.GeoDataFrame:
     """Load and dissolve arid-region polygons to EPSG:4326."""
     path = Path(path or DEFAULT_ARID_AREAS_PATH)
-    gdf = gpd.read_file(path)
+    gdf = _read_shapefile(path)
     if gdf.crs is None:
         gdf = gdf.set_crs(4326)
     elif gdf.crs.to_epsg() != 4326:
@@ -592,7 +834,7 @@ def load_arid_domains(
     """Load arid-region domain polygons (one row per domain, not dissolved)."""
     cfg = cfg or load_sws_config()
     path = Path(path or cfg.arid_areas_path)
-    gdf = gpd.read_file(path)
+    gdf = _read_shapefile(path)
     if gdf.crs is None:
         gdf = gdf.set_crs(4326)
     elif gdf.crs.to_epsg() != 4326:
@@ -674,53 +916,47 @@ def download_glolakes(
     """Download GloLakes NetCDF products from NCI THREDDS."""
     cfg = cfg or load_sws_config()
     file_map = GLOLAKES_V10_FILES if version == "v1.0" else GLOLAKES_V11_FILES
-    products = products or list(file_map.keys())
+    products = list(products or file_map.keys())
+    missing = [p for p in products if p not in file_map]
+    if missing:
+        raise ValueError(f"Unknown GloLakes products for {version}: {missing}")
 
     out_dir = cfg.raw_dir / "glolakes" / version
     out_dir.mkdir(parents=True, exist_ok=True)
     downloaded: Dict[str, Path] = {}
-    _dl_note(f"  {len(products)} GloLakes NetCDF product(s) → {out_dir}")
+    _note(f"{len(products)} GloLakes NetCDF product(s)")
+    _note(f"dir: {_rel(out_dir)}/")
 
     def _fetch(key: str) -> Tuple[str, Path]:
         rel = file_map[key]
         dest = out_dir / Path(rel).name
         url = _glolakes_url(rel)
         remote_size = _remote_content_length(url)
-        if dest.exists() and not force:
-            local_size = dest.stat().st_size
-            if remote_size and local_size == remote_size:
-                return key, dest
-            if remote_size and local_size != remote_size:
-                _dl_note(
-                    f"  incomplete {key} ({local_size / 1e6:.1f} / {remote_size / 1e6:.1f} MB) — re-downloading"
-                )
-                dest.unlink()
-            elif local_size > 1_000_000:
-                return key, dest
-        path = _download_file_url(url, dest, desc=key, expected_size=remote_size)
-        if remote_size and path.stat().st_size != remote_size:
-            logger.warning(
-                "GloLakes %s size mismatch after download (%s vs %s bytes)",
-                key,
-                path.stat().st_size,
-                remote_size,
+        path = _download_file_url(
+            url,
+            dest,
+            desc=key,
+            expected_size=remote_size,
+            force=force,
+        )
+        if remote_size and path.stat().st_size < remote_size:
+            raise RuntimeError(
+                f"GloLakes {key} incomplete after download "
+                f"({path.stat().st_size} of {remote_size} bytes)"
             )
-        elif path.stat().st_size < 1_000_000:
-            logger.warning(
-                "GloLakes %s download may be incomplete (%s bytes). "
-                "Re-download from NCI THREDDS if processing fails.",
-                key,
-                path.stat().st_size,
-            )
-            update_reference_md(
-                "Known issues log",
-                f"GloLakes {key} file suspiciously small ({path.stat().st_size} bytes)",
+        if path.stat().st_size < 1_000_000:
+            raise RuntimeError(
+                f"GloLakes {key} download suspiciously small ({path.stat().st_size} bytes)"
             )
         return key, path
 
     results = _parallel_map(_fetch, products, max_workers=cfg.n_download_workers, desc="GloLakes")
     for key, path in results:
         downloaded[key] = path
+
+    missing_keys = [p for p in products if p not in downloaded]
+    if missing_keys:
+        raise RuntimeError(f"GloLakes download incomplete; missing: {missing_keys}")
 
     update_reference_md(
         "Known issues log",
@@ -743,6 +979,10 @@ def load_glolakes_dataset(
     local = cfg.raw_dir / "glolakes" / version / Path(file_map[product]).name
     if local.exists():
         return xr.open_dataset(local, engine="netcdf4")
+    _note(
+        f"local GloLakes missing ({_rel(local)}); opening remote. "
+        "Run run_download_all() or download_glolakes() to cache locally."
+    )
     url = _glolakes_url(file_map[product])
     return xr.open_dataset(url, engine="netcdf4")
 
@@ -793,10 +1033,19 @@ def extract_glolakes_timeseries(
 ) -> pd.DataFrame:
     """Extract storage time series for one HydroLAKES / GloLakes ID."""
     if id_index is not None:
+        if lake_id not in id_index:
+            raise KeyError(
+                f"lake_id {lake_id} not found in GloLakes ID index"
+            )
         idx = id_index[lake_id]
     else:
         ids = ds["ID"].values.astype(int)
-        idx = int(np.where(ids == lake_id)[0][0])
+        matches = np.where(ids == lake_id)[0]
+        if len(matches) == 0:
+            raise KeyError(
+                f"lake_id {lake_id} not found in GloLakes dataset"
+            )
+        idx = int(matches[0])
     storage = ds["lake_storage"].isel(ID=idx).values
     if times is None:
         times = pd.to_datetime(ds["time"].values)
@@ -846,287 +1095,9 @@ def build_glolakes_arid_catalog(
     arid = arid.sort_values(sort_col, ascending=False).reset_index(drop=True)
     out_path = cfg.catalog_dir / f"glolakes_arid_{product}.csv"
     arid.drop(columns="geometry").to_csv(out_path, index=False)
-    _dl_note(f"  arid catalog ({filter_method}): {len(arid)} lakes → {out_path}")
+    _note(f"arid catalog ({filter_method}): {len(arid)} lakes")
+    _item(_rel(out_path), "ok")
     return arid
-
-
-# ---------------------------------------------------------------------------
-# DAHITI
-# ---------------------------------------------------------------------------
-
-def _dahiti_request(endpoint: str, params: Dict[str, Any], cfg: SWSConfig) -> Dict:
-    api_key = cfg.dahiti_api_key
-    if not api_key:
-        raise RuntimeError("DAHITI_API_KEY not set. Copy .env.example to .env and add your key.")
-    params = dict(params)
-    params["api_key"] = api_key
-    url = f"{DAHITI_API_BASE}/{endpoint.strip('/')}/"
-    resp = requests.post(url, data=params, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    code = data.get("code")
-    if code is not None and code != 200:
-        raise RuntimeError(f"DAHITI error: {data.get('message')}")
-    return data
-
-
-_DAHITI_TARGET_COLUMNS = [
-    "dahiti_id",
-    "lake_name",
-    "country",
-    "lat",
-    "lon",
-    "target_type",
-    "dataset_source",
-]
-
-
-def list_dahiti_targets(
-    cfg: Optional[SWSConfig] = None,
-    volume_only: bool = True,
-) -> pd.DataFrame:
-    """List DAHITI targets with metadata (API v2: payload under ``data``)."""
-    cfg = cfg or load_sws_config()
-    data = _dahiti_request("list-targets", {}, cfg)
-    targets = data.get("targets") or data.get("data") or []
-    rows = []
-    for t in targets:
-        access = t.get("data_access") or {}
-        if volume_only and isinstance(access, dict):
-            if access.get("volume_variation") != "public":
-                continue
-
-        lat_raw = t.get("latitude")
-        lon_raw = t.get("longitude")
-        dahiti_id = t.get("dahiti_id", t.get("id"))
-        rows.append(
-            {
-                "dahiti_id": int(dahiti_id) if dahiti_id is not None else np.nan,
-                "lake_name": t.get("target_name"),
-                "country": t.get("country"),
-                "lat": float(lat_raw) if lat_raw not in (None, "") else np.nan,
-                "lon": float(lon_raw) if lon_raw not in (None, "") else np.nan,
-                "target_type": t.get("type"),
-                "dataset_source": "DAHITI",
-            }
-        )
-    if not rows:
-        return pd.DataFrame(columns=_DAHITI_TARGET_COLUMNS)
-    return pd.DataFrame(rows)
-
-
-def _download_one_dahiti_volume(dahiti_id: int, out_dir: Path, cfg: SWSConfig) -> Optional[Path]:
-    dest = out_dir / f"{dahiti_id}_volume.json"
-    if dest.exists():
-        return dest
-    try:
-        data = _dahiti_request(
-            "download-volume-variation",
-            {"dahiti_id": dahiti_id, "format": "json"},
-            cfg,
-        )
-        dest.write_text(json.dumps(data), encoding="utf-8")
-        return dest
-    except Exception as exc:
-        logger.warning("DAHITI download failed for %s: %s", dahiti_id, exc)
-        return None
-
-
-def download_dahiti_volumes(
-    lake_ids: Optional[Sequence[int]] = None,
-    cfg: Optional[SWSConfig] = None,
-    arid_only: bool = True,
-) -> pd.DataFrame:
-    """Bulk-download DAHITI volume-variation time series."""
-    cfg = cfg or load_sws_config()
-    if not cfg.dahiti_api_key:
-        update_reference_md("Known issues log", "DAHITI skipped (no API key)")
-        return pd.DataFrame(columns=_DAHITI_TARGET_COLUMNS)
-    out_dir = cfg.raw_dir / "dahiti" / "volume"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    targets = list_dahiti_targets(cfg)
-    for col in ("lat", "lon"):
-        if col not in targets.columns:
-            targets[col] = np.nan
-
-    if targets.empty:
-        _dl_note("  ⊘ no DAHITI volume targets returned from API")
-        return targets
-
-    if arid_only:
-        geo_targets = targets.dropna(subset=["lat", "lon"], how="any")
-        if geo_targets.empty:
-            _dl_note("  ⊘ no DAHITI targets with coordinates for arid filtering")
-            return geo_targets
-        gdf = gpd.GeoDataFrame(
-            geo_targets,
-            geometry=[Point(r.lon, r.lat) for r in geo_targets.itertuples()],
-            crs="EPSG:4326",
-        )
-        targets = filter_lakes_to_arid(gdf).drop(columns="geometry", errors="ignore")
-
-    if lake_ids is not None:
-        targets = targets[targets["dahiti_id"].isin(lake_ids)]
-
-    ids = targets["dahiti_id"].astype(int).tolist()
-    _dl_note(f"  {len(ids)} arid lake(s) via DAHITI API → {out_dir}")
-
-    def _task(did: int):
-        return _download_one_dahiti_volume(did, out_dir, cfg)
-
-    _parallel_map(_task, ids, max_workers=cfg.n_download_workers, desc="DAHITI")
-    catalog_path = cfg.catalog_dir / "dahiti_arid_targets.csv"
-    targets.to_csv(catalog_path, index=False)
-    update_reference_md("Known issues log", f"DAHITI: requested {len(ids)} volume series")
-    return targets
-
-
-# ---------------------------------------------------------------------------
-# Hydroweb
-# ---------------------------------------------------------------------------
-
-def download_hydroweb_lakes(
-    bbox: Optional[Sequence[float]] = None,
-    cfg: Optional[SWSConfig] = None,
-    collections: Sequence[str] = HYDROWEB_COLLECTIONS,
-    refresh: bool = True,
-) -> Path:
-    """Download Hydroweb lake time series for a bounding box via py-hydroweb.
-
-    When ``refresh`` is True (default), existing files under ``raw/hydroweb`` are
-    removed first so each run yields one clean copy (Hydroweb zips use unique
-    workflow IDs and would otherwise accumulate duplicates).
-    """
-    cfg = cfg or load_sws_config()
-    if not cfg.hydroweb_api_key:
-        update_reference_md("Known issues log", "Hydroweb skipped (no API key)")
-        return cfg.raw_dir / "hydroweb"
-
-    try:
-        import py_hydroweb
-    except ImportError as exc:
-        raise ImportError("Install py-hydroweb: pip install py-hydroweb") from exc
-
-    if bbox is None:
-        arid = load_arid_mask(cfg.arid_areas_path)
-        minx, miny, maxx, maxy = arid.total_bounds
-        bbox = [float(minx), float(miny), float(maxx), float(maxy)]
-
-    out_dir = cfg.raw_dir / "hydroweb"
-    if refresh and out_dir.exists() and any(out_dir.iterdir()):
-        _dl_note(f"  clearing previous Hydroweb data in {out_dir} …")
-        shutil.rmtree(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    _dl_note(f"  Hydroweb basket ({', '.join(collections)}) for arid bbox …")
-    client = py_hydroweb.Client(api_key=cfg.hydroweb_api_key)
-    basket = py_hydroweb.DownloadBasket("sws_arid_lakes")
-    for coll in collections:
-        basket.add_collection(coll, bbox=list(bbox))
-    cwd = os.getcwd()
-    os.chdir(out_dir)
-    try:
-        client.submit_and_download_zip(basket)
-    finally:
-        os.chdir(cwd)
-
-    zips = list(out_dir.glob("*.zip"))
-    for z in zips:
-        with zipfile.ZipFile(z, "r") as zf:
-            zf.extractall(out_dir / z.stem)
-    _dl_note(f"  ✓ Hydroweb: {len(zips)} archive(s) extracted → {out_dir}")
-
-    update_reference_md("Known issues log", f"Hydroweb download to {out_dir} bbox={bbox}")
-    return out_dir
-
-
-# ---------------------------------------------------------------------------
-# G-REALM (LakePy)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# RECOG
-# ---------------------------------------------------------------------------
-
-def _pangaea_distribution_urls(doi: str) -> List[str]:
-    """Return downloadable content URLs from Pangaea JSON-LD metadata."""
-    meta_url = f"https://doi.pangaea.de/{doi}?format=metadata_jsonld"
-    resp = requests.get(meta_url, timeout=120)
-    resp.raise_for_status()
-    payload = resp.json()
-    if isinstance(payload, list):
-        payload = payload[0]
-    urls: List[str] = []
-    for item in payload.get("distribution", []):
-        url = item.get("contentUrl")
-        if url and "format=textfile" in url:
-            urls.append(url)
-    if not urls:
-        urls.append(f"https://doi.pangaea.de/{doi}?format=textfile")
-    return urls
-
-
-def _recog_metadata_valid(path: Path) -> bool:
-    """True if Pangaea textfile metadata looks usable (HEAD size is unreliable)."""
-    if not path.exists() or path.stat().st_size < 500:
-        return False
-    head = path.read_text(encoding="utf-8", errors="ignore")[:200]
-    return "DATA DESCRIPTION" in head or "PANGAEA" in head.upper()
-
-
-def download_recog(cfg: Optional[SWSConfig] = None, force: bool = False) -> Path:
-    """Download RECOG-LR RL01 correction archive from Pangaea."""
-    cfg = cfg or load_sws_config()
-    out_dir = cfg.raw_dir / "recog"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = out_dir / "RECOG_LR_RL01.zip"
-    text_path = out_dir / "RECOG_LR_RL01.tab"
-    text_url = f"https://doi.pangaea.de/{RECOG_PANGAEA_DOI}?format=textfile"
-
-    if not force and _recog_metadata_valid(text_path):
-        _dl_note(f"  ✓ cached RECOG-LR ({text_path.name})")
-        return text_path
-    if not force and zip_path.exists() and zipfile.is_zipfile(zip_path):
-        _dl_note(f"  ✓ cached RECOG-LR ({zip_path.name})")
-        return zip_path
-
-    _dl_note("  ↓ RECOG-LR metadata from Pangaea (zip unavailable for this DOI) …")
-    last_err: Optional[Exception] = None
-    try:
-        _download_file_url(text_url, text_path, timeout=1200, desc="RECOG-LR metadata")
-        if _recog_metadata_valid(text_path):
-            update_reference_md(
-                "Known issues log",
-                "RECOG-LR: Pangaea metadata saved; grid NetCDF may require ESSD supplement.",
-            )
-            return text_path
-    except Exception as exc:
-        last_err = exc
-        logger.warning("RECOG metadata download failed: %s", exc)
-
-    # Legacy fallbacks (optional supplementary files).
-    extracted = out_dir / "extracted"
-    extracted.mkdir(parents=True, exist_ok=True)
-    downloaded = int(_recog_metadata_valid(text_path))
-    for url in _pangaea_distribution_urls(RECOG_PANGAEA_DOI):
-        if url.endswith("textfile"):
-            continue
-        try:
-            dest = extracted / Path(url.split("format=")[-1])
-            _download_file_url(url, dest, timeout=1200)
-            downloaded += 1
-        except Exception as exc:
-            logger.debug("RECOG supplementary download skipped %s: %s", url, exc)
-
-    if downloaded == 0:
-        raise RuntimeError("RECOG download failed; no Pangaea files retrieved") from last_err
-
-    update_reference_md(
-        "Known issues log",
-        "RECOG-LR: Pangaea zip unavailable; saved tab-delimited matrix. "
-        "Grid/SH NetCDF files may require manual download from ESSD supplement.",
-    )
-    return text_path if text_path.exists() else extracted
 
 
 # ---------------------------------------------------------------------------
@@ -1417,11 +1388,14 @@ def rank_datasets_by_completeness(
 ) -> pd.DataFrame:
     """Add completeness % per lake and sort by area or completeness."""
     out = catalog.copy()
-    out["completeness_pct"] = out["lake_id"].map(
-        lambda lid: 100.0 * completeness_fraction(series_map[lid], start, end)
-        if lid in series_map
-        else np.nan
-    )
+
+    def _pct(lid):
+        series = series_map.get(lid)
+        if series is None:
+            return np.nan
+        return 100.0 * completeness_fraction(series, start, end)
+
+    out["completeness_pct"] = out["lake_id"].map(_pct)
     return sort_arid_catalog(out, sort_by=sort_by, ascending=False)
 
 
@@ -1441,8 +1415,6 @@ def process_lake_to_volume_anomaly(
 
     if "volume_km3" not in df.columns and "storage_mcm" in df.columns:
         df["volume_km3"] = df["storage_mcm"] * 0.001
-    elif dataset.upper() == "DAHITI" and "volume_km3" in df.columns:
-        pass
     elif "volume_km3" not in df.columns:
         raise ValueError(f"Could not derive volume_km3 for dataset {dataset}")
 
@@ -1680,9 +1652,8 @@ def build_glolakes_swsa_batch(
                 )
             else:
                 ranked, series_map = load_glolakes_batch_cache(paths)
-                _dl_note(
-                    f"  loaded batch cache ({len(series_map)} lakes) → {paths['cache_dir']}/{stem}_*"
-                )
+                _note(f"loaded batch cache ({len(series_map)} lakes)")
+                _item(f"{_rel(paths['cache_dir'])}/{stem}_*", "ok")
                 return _prepare_batch_catalog(ranked), series_map
         except Exception as exc:
             logger.warning("Batch cache load failed (%s); rebuilding.", exc)
@@ -1718,7 +1689,8 @@ def build_glolakes_swsa_batch(
 
     rows = list(arid_catalog.itertuples())
     n_workers = cfg.n_process_workers if cfg.n_process_workers > 0 else (os.cpu_count() or 1)
-    _dl_note(f"  processing {len(rows)} lakes ({n_workers} thread workers)...")
+    _announce_resources()
+    _note(f"processing {len(rows)} lakes ({n_workers} thread workers)")
     results = _parallel_thread_map(
         _one,
         rows,
@@ -1726,6 +1698,10 @@ def build_glolakes_swsa_batch(
         desc="GloLakes volumes",
         unit="lake",
     )
+
+    n_total = len(results)
+    failed_ids = [lake_id for lake_id, vol_raw in results if vol_raw is None]
+    _summarize_skipped("lakes", len(failed_ids), n_total, examples=failed_ids)
 
     raw_series_map: Dict[int, pd.Series] = {}
     series_map: Dict[int, pd.Series] = {}
@@ -1770,9 +1746,8 @@ def build_glolakes_swsa_batch(
             paths=paths,
         )
         save_glolakes_batch_cache(ranked, series_map, paths, manifest)
-        _dl_note(
-            f"  saved batch cache ({len(series_map)} lakes) → {paths['cache_dir']}/{stem}_*"
-        )
+        _note(f"saved batch cache ({len(series_map)} lakes)")
+        _item(f"{_rel(paths['cache_dir'])}/{stem}_*", "ok")
 
     return ranked, series_map
 
@@ -1916,12 +1891,12 @@ def plot_lake_volume_anomaly(
 # ---------------------------------------------------------------------------
 
 def _import_grace_analysis_utils():
-    """Import shared GRACE/predictor helpers from the parent Cursor folder."""
+    """Import shared GRACE/predictor helpers from ``src/`` (same as notebooks)."""
     import sys
 
-    cursor_dir = Path(__file__).resolve().parent.parent
-    if str(cursor_dir) not in sys.path:
-        sys.path.insert(0, str(cursor_dir))
+    src_dir = Path(__file__).resolve().parent
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
     from grace_analysis_utils import process_grace_data, process_predictor_fine
 
     return process_grace_data, process_predictor_fine
@@ -1951,6 +1926,17 @@ def process_grace_mean(
     """
     process_grace_data, _ = _import_grace_analysis_utils()
     cfg = cfg or load_sws_config()
+    for label, path in (
+        ("CSR GRACE", cfg.csr_grace_path),
+        ("JPL GRACE", cfg.jpl_grace_path),
+        ("GSFC GRACE", cfg.gsfc_grace_path),
+        ("CSR land mask", cfg.csr_mask_path),
+    ):
+        if not Path(path).exists():
+            raise FileNotFoundError(
+                f"{label} not found: {_rel(path)}. "
+                "Run notebook 01 or download_grace_mascons() first."
+            )
     aoi_geometry = aoi_geometry if aoi_geometry is not None else load_aoi_geometry(cfg)
     time_range = time_range if time_range is not None else build_grace_time_range(cfg)
 
@@ -2001,7 +1987,12 @@ def process_precip_on_grace_grid(
     """
     _, process_predictor_fine = _import_grace_analysis_utils()
     cfg = cfg or load_sws_config()
-    precip_path = precip_path or cfg.precip_path
+    precip_path = Path(precip_path or cfg.precip_path)
+    if not precip_path.exists():
+        raise FileNotFoundError(
+            f"Precipitation Zarr not found: {_rel(precip_path)}. "
+            "Use resolve_precip_path() or run notebook 01 first."
+        )
     aoi_geometry = aoi_geometry if aoi_geometry is not None else load_aoi_geometry(cfg)
     time_range = time_range if time_range is not None else build_grace_time_range(cfg)
 
@@ -2142,6 +2133,11 @@ def extract_precip_at_lake(
 def _lake_lat_lon(lake_meta: Dict[str, Any]) -> Tuple[float, float]:
     lat = lake_meta.get("lat_centroid", lake_meta.get("lat", lake_meta.get("latitude")))
     lon = lake_meta.get("lon_centroid", lake_meta.get("lon", lake_meta.get("longitude")))
+    if lat is None or lon is None:
+        raise ValueError(
+            "lake_meta missing lat/lon; expected one of "
+            "lat_centroid/lat/latitude and lon_centroid/lon/longitude"
+        )
     return float(lat), float(lon)
 
 
@@ -2757,7 +2753,7 @@ def compute_grace_pixel_summaries(
     groups = group_lake_ids_by_grace_pixel(catalog, volume_series, grace_da)
     items = sorted(groups.items())
     n_lakes = sum(len(ids) for _, ids in items)
-    _dl_note(f"  GRACE pixel summaries ({len(items)} pixels, {n_lakes} lakes)...")
+    _note(f"GRACE pixel summaries ({len(items)} pixels, {n_lakes} lakes)")
 
     def _one(item: Tuple[Tuple[float, float], List[int]]) -> Optional[Dict[str, Any]]:
         (grace_lat, grace_lon), lake_ids = item
@@ -2839,7 +2835,7 @@ def compute_lake_grace_summaries(
             return None
 
     rows = [row for _, row in catalog.iterrows() if row.get("lake_id", row.name) in volume_series]
-    _dl_note(f"  lake/GRACE summaries ({len(rows)} lakes)...")
+    _note(f"lake/GRACE summaries ({len(rows)} lakes)")
     n_jobs = cfg.n_process_workers if parallel else 1
     if len(rows) > 1:
         results = _parallel_thread_map(
@@ -3802,12 +3798,12 @@ def plot_lake_std_ratio_map(
         )
         label = "GRACE pixels" if mode == "grace_pixel" else "lakes"
         if min_pct is not None and float(min_pct) > 0:
-            print(
-                f"{len(table_df)} {label} with {value_col} > {float(min_pct):g}% of GRACE σ "
-                f"(sorted highest to lowest)"
+            _note(
+                f"{len(table_df)} {label} with lake std > {float(min_pct):g}% of GRACE "
+                "(sorted high to low)"
             )
         else:
-            print(f"{len(table_df)} {label} (sorted by {value_col}, highest to lowest)")
+            _note(f"{len(table_df)} {label} (sorted high to low)")
         return table_df
     return fig
 
@@ -3888,10 +3884,173 @@ def export_lake_std_ratio_shapefile(
 
     save_path.parent.mkdir(parents=True, exist_ok=True)
     gdf.to_file(save_path)
-
-    label = "GRACE pixel(s)" if mode == "grace_pixel" else "lake(s)"
-    print(f"Exported {len(gdf)} {label} to {save_path}")
+    _item(_rel(save_path), "ok")
     return gdf
+
+
+# Reader-facing column headers for the Fig S11 / supplement table.
+_STD_RATIO_TABLE_RENAME_PIXEL = {
+    "grace_lat": "GRACE pixel latitude (deg)",
+    "grace_lon": "GRACE pixel longitude (deg)",
+    "n_lakes": "Number of lakes in pixel",
+    "lake_ids": "HydroLAKES IDs",
+    "lake_names": "Lake names",
+    "country": "Country",
+    "area_km2": "Total lake area (km2)",
+    "completeness_pct": "Lake record completeness (%)",
+    "lake_std_pct_of_grace": "Lake std as % of GRACE std",
+    "lake_std_cm": "Lake storage std (cm WE)",
+    "grace_std_cm": "GRACE TWSA std (cm WE)",
+    "lake_std_pct_of_grace_residual": "Residual lake std as % of GRACE",
+    "lake_std_cm_residual": "Residual lake storage std (cm WE)",
+    "grace_std_cm_residual": "Residual GRACE TWSA std (cm WE)",
+    "lake_trend_cm_yr": "Lake trend (cm/yr)",
+    "grace_trend_cm_yr": "GRACE trend (cm/yr)",
+    "n_overlap_months": "Overlap months",
+    "window_deg": "GRACE window (deg)",
+    "grace_window_area_km2": "GRACE window area (km2)",
+    "haversine_distance_deg": "Distance to GRACE cell (deg)",
+}
+
+_STD_RATIO_TABLE_RENAME_LAKE = {
+    "lake_id": "HydroLAKES ID",
+    "lake_name": "Lake name",
+    "country": "Country",
+    "lat": "Lake latitude (deg)",
+    "lon": "Lake longitude (deg)",
+    "grace_lat": "GRACE pixel latitude (deg)",
+    "grace_lon": "GRACE pixel longitude (deg)",
+    "area_km2": "Lake area (km2)",
+    "completeness_pct": "Lake record completeness (%)",
+    "lake_std_pct_of_grace": "Lake std as % of GRACE std",
+    "lake_std_cm": "Lake storage std (cm WE)",
+    "grace_std_cm": "GRACE TWSA std (cm WE)",
+    "lake_std_pct_of_grace_residual": "Residual lake std as % of GRACE",
+    "lake_std_cm_residual": "Residual lake storage std (cm WE)",
+    "grace_std_cm_residual": "Residual GRACE TWSA std (cm WE)",
+    "lake_trend_cm_yr": "Lake trend (cm/yr)",
+    "grace_trend_cm_yr": "GRACE trend (cm/yr)",
+    "n_overlap_months": "Overlap months",
+    "window_deg": "GRACE window (deg)",
+    "grace_window_area_km2": "GRACE window area (km2)",
+    "haversine_distance_deg": "Distance to GRACE cell (deg)",
+}
+
+_STD_RATIO_TABLE_DROP = {
+    "record_type",
+    "grid_assignment",
+    "n_grace_pixels",
+    "lake_id",  # prefer lake_ids in pixel mode
+    "lake_name",  # prefer lake_names in pixel mode
+    "_ratio",
+    "plot_lat",
+    "plot_lon",
+    "geometry",
+}
+
+
+def clean_lake_std_ratio_table(
+    filtered_df: pd.DataFrame,
+    *,
+    summary_mode: str = "grace_pixel",
+) -> pd.DataFrame:
+    """
+    Rename and trim a filtered Fig S11 summary for a reader-facing supplement table.
+
+    Drops internal columns, renames remaining fields with clear units, and rounds
+    numeric values. Does not write to disk.
+    """
+    mode = _normalize_summary_mode(summary_mode)
+    rename_map = (
+        _STD_RATIO_TABLE_RENAME_PIXEL if mode == "grace_pixel" else _STD_RATIO_TABLE_RENAME_LAKE
+    )
+    drop = set(_STD_RATIO_TABLE_DROP)
+    if mode == "grace_pixel":
+        drop |= {"lat", "lon"}  # duplicates of grace_lat / grace_lon
+    else:
+        drop -= {"lake_id", "lake_name"}
+
+    df = filtered_df.copy()
+    df = df.drop(columns=[c for c in drop if c in df.columns], errors="ignore")
+
+    # Stable column order: known rename keys first, then any leftovers
+    ordered = [c for c in rename_map if c in df.columns]
+    leftovers = [c for c in df.columns if c not in ordered]
+    df = df[ordered + leftovers]
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    lat_lon_cols = [c for c in df.columns if "latitude" in c.lower() or "longitude" in c.lower()]
+    area_cols = [c for c in df.columns if "area (km2)" in c.lower()]
+    pct_std_trend = [
+        c for c in df.columns
+        if any(tok in c.lower() for tok in ("std", "%", "trend", "completeness", "distance", "window (deg)"))
+        and c not in area_cols
+    ]
+    for col in lat_lon_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").round(3)
+    for col in area_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").round(1)
+    for col in pct_std_trend:
+        if pd.api.types.is_numeric_dtype(df[col]) or df[col].dtype == object:
+            num = pd.to_numeric(df[col], errors="coerce")
+            if num.notna().any():
+                df[col] = num.round(2)
+
+    return df.reset_index(drop=True)
+
+
+def export_lake_std_ratio_table(
+    filtered_df: pd.DataFrame,
+    *,
+    summary_mode: str = "grace_pixel",
+    save_path: Union[str, Path],
+    min_pct: Optional[float] = None,
+) -> pd.DataFrame:
+    """
+    Clean and save the filtered Fig S11 lake/pixel table as UTF-8 CSV for the supplement.
+
+    Parameters
+    ----------
+    filtered_df : pd.DataFrame
+        Output of ``plot_lake_std_ratio_map(..., return_table=True)``.
+    summary_mode : {'per_lake', 'grace_pixel'}
+    save_path : str or Path
+        Destination CSV path (parent dirs created as needed).
+    min_pct : float or None
+        Optional threshold used only for the status line.
+
+    Returns
+    -------
+    pd.DataFrame
+        The cleaned table written to ``save_path``.
+    """
+    mode = _normalize_summary_mode(summary_mode)
+    cleaned = clean_lake_std_ratio_table(filtered_df, summary_mode=mode)
+    # Excel-safe HydroLAKES ID text (comma-separated lists otherwise truncate).
+    for col in cleaned.columns:
+        if "hydrolakes id" in str(col).lower():
+            cleaned[col] = cleaned[col].map(
+                lambda v: (
+                    ""
+                    if v is None or (isinstance(v, float) and pd.isna(v))
+                    else (
+                        str(v)
+                        if str(v).startswith('="')
+                        else f'="{str(v).strip().replace(chr(34), chr(34)+chr(34))}"'
+                    )
+                )
+            )
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned.to_csv(save_path, index=False, encoding="utf-8-sig")
+
+    label = "GRACE pixels" if mode == "grace_pixel" else "lakes"
+    if min_pct is not None and float(min_pct) > 0:
+        _announce(f"Fig S11: {len(cleaned)} {label} (lake std > {float(min_pct):g}% of GRACE)")
+    else:
+        _announce(f"Fig S11: {len(cleaned)} {label}")
+    _item(_rel(save_path), "ok")
+    return cleaned
 
 
 def plot_lake_std_ratio_maps_by_domain(
@@ -4093,7 +4252,8 @@ def plot_lake_std_ratio_maps_by_domain(
     return figures
 
 
-def analyze_lake_grace_comparisons(
+def save_lake_grace_comparison_figures(
+    summary_df: pd.DataFrame,
     catalog: pd.DataFrame,
     volume_series: Dict[Any, pd.Series],
     grace_da: xr.DataArray,
@@ -4102,50 +4262,24 @@ def analyze_lake_grace_comparisons(
     window_deg: float = 1.0,
     parallel: bool = True,
     aggregate_by_grace_pixel: bool = False,
-    save_figures: bool = False,
     show: bool = False,
-    calculate_residual: bool = False,
-) -> Tuple[pd.DataFrame, List[Path]]:
+) -> List[Path]:
     """
-    Compute lake vs GRACE summary statistics and optionally save comparison plots.
+    Save lake/GRACE/precip comparison JPEGs for each row in ``summary_df``.
 
-    Parameters
-    ----------
-    aggregate_by_grace_pixel : bool
-        If True, lakes sharing the same ``(grace_lat, grace_lon)`` are combined:
-        volume anomalies (km³) are **summed**, converted once to cm, and compared
-        to one GRACE series per pixel. Std/trends are computed on that combined
-        cm series (not by combining per-lake std values).
-    calculate_residual : bool
-        If True, also decomposes both series (calendar-phase-locked linear trend +
-        annual + semi-annual harmonic fit) and adds residual-based std/pct columns
-        to ``summary_df``. Does not affect figure saving.
-
-    Returns
-    -------
-    summary_df : pd.DataFrame
-        Per-lake rows, or per-pixel rows when ``aggregate_by_grace_pixel=True``.
-    saved_plots : list of Path
-        Empty when ``save_figures=False``.
+    Pass a threshold-filtered table (e.g. ``plot_lake_std_ratio_map(..., return_table=True)``)
+    to write only Fig S11-qualifying figures instead of every summary row.
     """
     cfg = cfg or load_sws_config()
-    summary_df = compute_lake_grace_summaries(
-        catalog,
-        volume_series,
-        grace_da,
-        cfg=cfg,
-        window_deg=window_deg,
-        parallel=parallel,
-        aggregate_by_grace_pixel=aggregate_by_grace_pixel,
-        calculate_residual=calculate_residual,
-    )
-    saved: List[Path] = []
-    if not save_figures:
-        return summary_df, saved
+    if summary_df is None or summary_df.empty:
+        _note("no comparison figures to save (empty table)")
+        return []
 
-    show = False
+    cfg.figures_dir.mkdir(parents=True, exist_ok=True)
+    show = bool(show)
     n_figs = len(summary_df)
-    _dl_note(f"  saving {n_figs} comparison figure(s)...")
+    _note(f"saving {n_figs} comparison figure(s)")
+    _note(f"dir: {_rel(cfg.figures_dir)}/")
 
     def _plot_lake_row(row_dict):
         lake_id = row_dict.get("lake_id")
@@ -4205,128 +4339,80 @@ def analyze_lake_grace_comparisons(
     else:
         results = [plot_fn(r) for r in records]
     saved = [p for p in results if p is not None]
+    _item(f"{len(saved)} figures in {_rel(cfg.figures_dir)}/", "ok")
     logger.info("Saved %s lake/GRACE/precip plots to %s", len(saved), cfg.figures_dir)
-    return summary_df, saved
+    return saved
 
 
-def plot_filtered_lake_std_comparisons(
-    filtered_df: pd.DataFrame,
+def analyze_lake_grace_comparisons(
     catalog: pd.DataFrame,
     volume_series: Dict[Any, pd.Series],
     grace_da: xr.DataArray,
     precip_da: Optional[xr.DataArray] = None,
     cfg: Optional[SWSConfig] = None,
     window_deg: float = 1.0,
-    summary_mode: str = "per_lake",
-    save_dir: Optional[Union[str, Path]] = None,
+    parallel: bool = True,
+    aggregate_by_grace_pixel: bool = False,
     save_figures: bool = False,
     show: bool = False,
-    parallel: bool = True,
-) -> List[Path]:
+    calculate_residual: bool = False,
+) -> Tuple[pd.DataFrame, List[Path]]:
     """
-    Plot (and optionally save) the lake-vs-GRACE-vs-precip comparison for every
-    row of a ``plot_lake_std_ratio_map(..., return_table=True)`` table.
+    Compute lake vs GRACE summary statistics and optionally save comparison plots.
 
-    ``summary_mode='per_lake'``: one figure per lake (``plot_lake_grace_precip_comparison``).
-
-    ``summary_mode='grace_pixel'``: one figure per GRACE pixel, combining (summing)
-    every lake assigned to that pixel via ``plot_grace_pixel_lake_grace_comparison``
-    (no separate per-lake lines — matches the combined σ used to filter the table).
-
-    Filenames encode the identifying info plus the variability percentage that
-    qualified the row as filtered, e.g. ``filtered_1392_LakeName_pct86_win1.jpeg``
-    or ``filtered_pixel_25.5_55.0_n4_pct35_win1.jpeg``.
+    Prefer ``save_figures=False`` here, then call
+    ``save_lake_grace_comparison_figures`` on the threshold-filtered Fig S11 table
+    so only qualifying pixels/lakes get JPEGs.
 
     Parameters
     ----------
-    filtered_df : pd.DataFrame
-        Output of ``plot_lake_std_ratio_map(..., return_table=True)``.
-    save_dir : str or Path, optional
-        Defaults to ``cfg.figures_dir``.
-    save_figures : bool, default False
-        If True, saves each figure and suppresses inline display.
-    show : bool, default False
-        Ignored (forced False) when ``save_figures=True``.
+    aggregate_by_grace_pixel : bool
+        If True, lakes sharing the same ``(grace_lat, grace_lon)`` are combined:
+        volume anomalies (km3) are summed, converted once to cm, and compared
+        to one GRACE series per pixel. Std/trends are computed on that combined
+        cm series (not by combining per-lake std values).
+    calculate_residual : bool
+        If True, also decomposes both series (calendar-phase-locked linear trend +
+        annual + semi-annual harmonic fit) and adds residual-based std/pct columns
+        to ``summary_df``. Does not affect figure saving.
+    save_figures : bool
+        If True, saves a JPEG for every summary row (can be hundreds). Prefer
+        filtering first, then ``save_lake_grace_comparison_figures``.
 
     Returns
     -------
-    list of Path
-        Saved figure paths (empty when ``save_figures=False``).
+    summary_df : pd.DataFrame
+        Per-lake rows, or per-pixel rows when ``aggregate_by_grace_pixel=True``.
+    saved_plots : list of Path
+        Empty when ``save_figures=False``.
     """
     cfg = cfg or load_sws_config()
-    mode = _normalize_summary_mode(summary_mode)
-    save_dir = Path(save_dir) if save_dir else cfg.figures_dir
-    if save_figures:
-        save_dir.mkdir(parents=True, exist_ok=True)
-        show = False
+    summary_df = compute_lake_grace_summaries(
+        catalog,
+        volume_series,
+        grace_da,
+        cfg=cfg,
+        window_deg=window_deg,
+        parallel=parallel,
+        aggregate_by_grace_pixel=aggregate_by_grace_pixel,
+        calculate_residual=calculate_residual,
+    )
+    if not save_figures:
+        return summary_df, []
 
-    def _plot_lake_row(row_dict):
-        lake_id = row_dict.get("lake_id")
-        if lake_id is None or lake_id not in volume_series:
-            return None
-        meta = catalog.loc[catalog["lake_id"] == lake_id]
-        if meta.empty:
-            return None
-        meta_dict = meta.iloc[0].to_dict()
-        safe_name = re.sub(
-            r"[^\w\-]+", "_",
-            _display_lake_name(meta_dict.get("lake_name")),
-        )[:60]
-        pct = row_dict.get("lake_std_pct_of_grace")
-        pct_label = f"_pct{float(pct):.0f}" if pct is not None and pd.notna(pct) else ""
-        out = save_dir / f"filtered_{lake_id}_{safe_name}{pct_label}_win{window_deg:g}.jpeg"
-        plot_lake_grace_precip_comparison(
-            meta_dict,
-            volume_series[lake_id],
-            grace_da,
-            precip_da=precip_da,
-            window_deg=window_deg,
-            cfg=cfg,
-            save_path=out if save_figures else None,
-            show=show,
-        )
-        return out if save_figures else None
-
-    def _plot_pixel_row(row_dict):
-        ids_str = row_dict.get("lake_ids", "")
-        lake_ids = [int(x) for x in str(ids_str).split(",") if str(x).strip()]
-        if not lake_ids:
-            return None
-        glat = float(row_dict["grace_lat"])
-        glon = float(row_dict["grace_lon"])
-        pct = row_dict.get("lake_std_pct_of_grace")
-        pct_label = f"_pct{float(pct):.0f}" if pct is not None and pd.notna(pct) else ""
-        out = save_dir / (
-            f"filtered_pixel_{glat:.1f}_{glon:.1f}_n{len(lake_ids)}{pct_label}_win{window_deg:g}.jpeg"
-        )
-        plot_grace_pixel_lake_grace_comparison(
-            glat,
-            glon,
-            lake_ids,
-            catalog,
-            volume_series,
-            grace_da,
-            precip_da=precip_da,
-            window_deg=window_deg,
-            cfg=cfg,
-            save_path=out if save_figures else None,
-            show=show,
-        )
-        return out if save_figures else None
-
-    records = filtered_df.to_dict("records")
-    plot_fn = _plot_pixel_row if mode == "grace_pixel" else _plot_lake_row
-    n_jobs = cfg.n_process_workers if parallel else 1
-    if save_figures and len(records) > 1 and parallel:
-        results = _parallel_thread_map(
-            plot_fn, records, n_jobs=n_jobs, desc="Saving filtered figures", unit="fig",
-        )
-    else:
-        results = [plot_fn(r) for r in records]
-    saved = [p for p in results if p is not None]
-    if save_figures:
-        logger.info("Saved %s filtered lake/GRACE/precip plots to %s", len(saved), save_dir)
-    return saved
+    saved = save_lake_grace_comparison_figures(
+        summary_df,
+        catalog,
+        volume_series,
+        grace_da,
+        precip_da=precip_da,
+        cfg=cfg,
+        window_deg=window_deg,
+        parallel=parallel,
+        aggregate_by_grace_pixel=aggregate_by_grace_pixel,
+        show=show,
+    )
+    return summary_df, saved
 
 
 # ---------------------------------------------------------------------------
@@ -4363,63 +4449,36 @@ def extract_grace_twsa_at_lake(
 
 
 # ---------------------------------------------------------------------------
-# Download inventory report
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # High-level pipeline entry points
 # ---------------------------------------------------------------------------
 
 def run_download_all(
     cfg: Optional[SWSConfig] = None,
-    include_dahiti: bool = True,
-    include_hydroweb: bool = True,
-    include_recog: bool = True,
     glolakes_version: str = "v1.0",
+    glolakes_products: Optional[Sequence[str]] = None,
+    force: bool = False,
 ) -> Dict[str, Any]:
-    """Download all configured datasets; skip API-gated sources if keys missing."""
+    """Download HydroLAKES polygons + GloLakes absolute ICESat-2 storage (paper pipeline)."""
     cfg = cfg or load_sws_config()
+    products = list(glolakes_products or ["absolute_icesat2"])
     summary: Dict[str, Any] = {}
-    n_steps = 4 + int(include_recog) + int(include_dahiti and bool(cfg.dahiti_api_key)) + int(
-        include_hydroweb and bool(cfg.hydroweb_api_key)
+    _announce_resources()
+
+    _announce("SWS data download (2 steps)")
+    _note(f"dir: {_rel(cfg.raw_dir)}/")
+    if force:
+        _note("FORCE=True (re-download raw files)")
+
+    _announce("[1/2] HydroLAKES (global lake polygons)")
+    summary["hydrolakes"] = str(download_hydrolakes(cfg, force=force))
+
+    _announce(f"[2/2] GloLakes {glolakes_version} ({', '.join(products)})")
+    glolakes_paths = download_glolakes(
+        cfg=cfg, products=products, version=glolakes_version, force=force
     )
-    step = 0
+    summary["glolakes"] = {k: str(v) for k, v in glolakes_paths.items()}
 
-    _dl_note(f"\n=== SWS data download ({n_steps} steps) ===")
-    _dl_note(f"Data root: {cfg.data_root}")
-    _dl_note(f"Raw files:  {cfg.raw_dir}")
-    _dl_note(f"Catalogs:   {cfg.catalog_dir}\n")
-
-    step += 1
-    _dl_note(f"[{step}/{n_steps}] HydroLAKES — global lake polygons")
-    summary["hydrolakes"] = str(download_hydrolakes(cfg))
-
-    step += 1
-    _dl_note(f"\n[{step}/{n_steps}] GloLakes {glolakes_version} — monthly lake storage NetCDFs")
-    summary["glolakes"] = download_glolakes(cfg=cfg, version=glolakes_version)
-
-    if include_recog:
-        step += 1
-        _dl_note(f"\n[{step}/{n_steps}] RECOG-LR — GRACE leakage correction (phase 2)")
-        summary["recog"] = str(download_recog(cfg))
-
-    if include_dahiti and cfg.dahiti_api_key:
-        step += 1
-        _dl_note(f"\n[{step}/{n_steps}] DAHITI — validation volume time series")
-        summary["dahiti"] = download_dahiti_volumes(cfg=cfg)
-    else:
-        _dl_note(f"\n[—] DAHITI — skipped (set DAHITI_API_KEY in .env)")
-        update_reference_md("Known issues log", "DAHITI skipped (no API key)")
-
-    if include_hydroweb and cfg.hydroweb_api_key:
-        step += 1
-        _dl_note(f"\n[{step}/{n_steps}] Hydroweb — major endorheic lakes")
-        summary["hydroweb"] = str(download_hydroweb_lakes(cfg=cfg))
-    else:
-        _dl_note(f"\n[—] Hydroweb — skipped (set HYDROWEB_API_KEY in .env)")
-        update_reference_md("Known issues log", "Hydroweb skipped (no API key)")
-
-    _dl_note("\n=== Download complete ===\n")
+    _announce("download complete")
     return summary
 
 

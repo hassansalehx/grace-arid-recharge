@@ -1,43 +1,32 @@
 """
-Pixel-based GRACE Response Analysis Functions
+Pixel-based GRACE response to extreme precipitation (EPE) analysis.
 
-This module contains functions for analyzing GRACE response to extreme precipitation events
-at the pixel level, calculating mean and standard deviation across multiple GRACE solutions.
+Notebook-facing surface (see ``__all__``):
+  ``analyze_grace_response_by_pixel``, ``plot_pixel_analysis_maps``,
+  ``plot_pixel_epe_grace_relationship``, ``plot_pixel_results_distribution_diagnostics``,
+  ``plot_event_cluster_distribution_and_relationship``,
+  ``join_lake_points_to_recharge_catalog``, ``export_table_s3_lake_recharge``,
+  ``summarize_arid_response_coverage``, ``plot_epe_grace_agg_uncertainty_collage``.
 
-Main Functions:
---------------
-1. analyze_grace_response_by_pixel: 
-   Main function for pixel-level analysis across all pixels. Calculates mean/std across 
-   GRACE solutions, flags extreme precipitation events, clusters them, and identifies valid
-   GRACE responses. Returns DataArrays with total precipitation, valid response sums, and std sums.
+Residual note:
+  When ``decompose_grace=True``, this module currently uses index-based
+  ``decompose_grace_sin_cosin`` (gap years already dropped from the series).
+  The TWSA-CPA correlation path in ``grace_analysis_utils`` uses calendar-locked
+  ``_decompose_grace_calendar``. Do not mix residual products without checking
+  that difference. Aligning both to calendar-locked residuals is a follow-up.
 
-2. analyze_grace_response_by_aquifer_pixel:
-   Applies pixel-level analysis to each aquifer boundary. Extracts pixels within each aquifer,
-   runs pixel analysis, and creates relationship plots showing precipitation vs GRACE response
-   with statistics (r, R², p-value, n).
-
-3. plot_pixel_analysis_maps:
-   Map grid of pixel analysis (default: four panels — EPE, GRACE, recharge efficiency,
-   uncertainty). Optional ``layout`` selects a single efficiency map or a three-panel strip
-   (EPE, GRACE, uncertainty).
-
-
-4. plot_pixel_epe_grace_relationship:
-   EPE vs GRACE scatter colored by uncertainty (%). ``aggregation='pixel'`` (default):
-   one point per grid cell (cumulative sums). ``aggregation='event'``: one point per
-   valid EPE cluster from ``events_dataframe``.
-
-5. plot_pixel_results_distribution_diagnostics:
-   2×2 histograms of cumulative EPE, GRACE response, uncertainty, and recharge efficiency
-   across pixels, with vertical markers at user-specified quantiles (diagnostic).
-
-Helper Functions:
-----------------
-- _coarsen_precipitation_to_grace: Coarsens precipitation to match GRACE spatial resolution
-- _cluster_events_within_window: Clusters extreme events within a time window (default 12 months)
-- _calculate_pixel_response: Calculates valid responses for a single pixel
-- _plot_aquifer_relationship: Plots relationship for a single aquifer
+Resources:
+  Pixel loops use joblib (``n_jobs=-1`` = all CPUs). Prefer clamping with
+  ``download_data.get_resource_config()`` from the notebook so Dask and joblib
+  do not oversubscribe. GPU is unused here.
 """
+
+from __future__ import annotations
+
+import os
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -53,10 +42,25 @@ from scipy.stats import linregress, pearsonr
 from scipy.optimize import curve_fit
 from scipy.stats import chi2, f as f_dist
 from tqdm import tqdm
-from pathlib import Path
-from shapely.geometry import mapping
+from shapely.geometry import Point, mapping
 from rasterio.features import rasterize
 from joblib import Parallel, delayed
+
+from grace_analysis_utils import format_pvalue
+
+__all__ = [
+    "analyze_grace_response_by_pixel",
+    "plot_event_cluster_distribution_and_relationship",
+    "plot_pixel_analysis_maps",
+    "plot_pixel_results_distribution_diagnostics",
+    "plot_pixel_epe_grace_relationship",
+    "plot_epe_grace_agg_uncertainty_collage",
+    "join_lake_points_to_recharge_catalog",
+    "export_table_s3_lake_recharge",
+    "build_pixel_analysis_catalog",
+    "summarize_arid_response_coverage",
+    "format_pvalue",
+]
 
 # Match grace_analysis_utils map layout (plot_aridity_raster / plot_multiple_maps_with_balanced_colorbar)
 _MAP_SUBPLOT_WSPACE = 0.0
@@ -69,32 +73,15 @@ _MAP_TIGHT_LAYOUT_PAD = 0.2
 # Cartopy gridline labels: lon/lat must use the same size or only one axis gets an explicit fontsize
 _MAP_GRID_LABEL_FONTSIZE = 9
 
-
-def format_pvalue(p_val):
-    """
-    Format p-value for display in plots.
-    
-    Parameters:
-    -----------
-    p_val : float
-        P-value to format
-        
-    Returns:
-    --------
-    str
-        Formatted p-value string:
-        - "< 0.01" if p < 0.01
-        - "< 0.05" if 0.01 <= p < 0.05
-        - Actual value if p >= 0.05
-    """
-    if pd.isna(p_val) or np.isnan(p_val):
-        return "N/A"
-    if p_val < 0.01:
-        return "< 0.01"
-    elif p_val < 0.05:
-        return "< 0.05"
-    else:
-        return f"{p_val:.2f}"
+from status_io import (  # noqa: E402
+    announce as _announce,
+    detect_repo_root as _repo_root,
+    item as _item,
+    note as _note,
+    raise_ctx as _raise_ctx,
+    rel as _rel,
+    summarize_skipped as _summarize_skipped,
+)
 
 
 def fit_model(x, y, model="linear"):
@@ -284,6 +271,19 @@ def _coarsen_precipitation_to_grace(precip_data, grace_reference, method='interp
     if method == 'interp':
         precip_coarsened = precip_data.interp(lat=grace_lat, lon=grace_lon, method='linear')
     else:
+        if len(grace_lat) < 2 or len(grace_lon) < 2:
+            _raise_ctx(
+                ValueError,
+                f"GRACE reference lat/lon must have length >= 2 to estimate "
+                f"resolution for coarsening (got lat={len(grace_lat)}, lon={len(grace_lon)})",
+            )
+        if len(precip_data.lat) < 2 or len(precip_data.lon) < 2:
+            _raise_ctx(
+                ValueError,
+                f"Precipitation lat/lon must have length >= 2 to estimate "
+                f"resolution for coarsening (got lat={len(precip_data.lat)}, "
+                f"lon={len(precip_data.lon)})",
+            )
         delta_lat_grace = np.abs(grace_lat.values[1] - grace_lat.values[0])
         delta_lat_precip = np.abs(precip_data.lat.values[1] - precip_data.lat.values[0])
         
@@ -337,6 +337,21 @@ def _cluster_events_within_window(extreme_dates, window_days=365):
             clusters.append((sorted_dates[start_idx], sorted_dates[end_idx]))
     
     return clusters
+
+
+def _nanstd_safe(values, ddof=1, default=0.0):
+    """Sample std that returns ``default`` when fewer than ``ddof + 1`` finite values."""
+    arr = np.asarray(values, dtype=float)
+    n_finite = int(np.isfinite(arr).sum())
+    if n_finite <= ddof:
+        return default
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Degrees of freedom <= 0 for slice",
+            category=RuntimeWarning,
+        )
+        return float(np.nanstd(arr, ddof=ddof))
 
 
 def _epe_baseline_window_bounds(start_evt, end_evt):
@@ -453,14 +468,14 @@ def _calculate_pixel_response(grace_solution_ts_list, precip_ts, clusters, min_v
             })
             continue
         
-        solution_diffs_array = np.array(solution_diffs)
+        solution_diffs_array = np.array(solution_diffs, dtype=float)
         diff_mean = np.nanmean(solution_diffs_array)
-        diff_std = np.nanstd(solution_diffs_array, ddof=1) if len(solution_diffs) > 1 else 0.0
-        
+        diff_std = _nanstd_safe(solution_diffs_array, ddof=1, default=0.0)
+
         avg_before_mean = np.nanmean(solution_before_means) if len(solution_before_means) > 0 else np.nan
         avg_after_mean = np.nanmean(solution_after_means) if len(solution_after_means) > 0 else np.nan
-        avg_before_std = np.nanstd(solution_before_means, ddof=1) if len(solution_before_means) > 1 else 0.0
-        avg_after_std = np.nanstd(solution_after_means, ddof=1) if len(solution_after_means) > 1 else 0.0
+        avg_before_std = _nanstd_safe(solution_before_means, ddof=1, default=0.0)
+        avg_after_std = _nanstd_safe(solution_after_means, ddof=1, default=0.0)
         
         if np.isnan(diff_mean):
             clusters_data.append({
@@ -679,6 +694,28 @@ def analyze_grace_response_by_pixel(
         from grace_analysis_utils import decompose_grace_sin_cosin
     except ImportError:
         raise ImportError("Cannot import decompose_grace_sin_cosin from grace_analysis_utils.")
+
+    if grace_solutions is None or len(grace_solutions) == 0:
+        _raise_ctx(
+            ValueError,
+            "grace_solutions is empty; provide at least one GRACE DataArray",
+        )
+    _required_dims = ("time", "lat", "lon")
+    for idx, grace in enumerate(grace_solutions):
+        missing = [d for d in _required_dims if d not in getattr(grace, "dims", ())]
+        if missing:
+            _raise_ctx(
+                ValueError,
+                f"grace_solutions[{idx}] missing required dimensions {missing}; "
+                f"need {_required_dims}",
+            )
+    precip_missing = [d for d in _required_dims if d not in getattr(precip_data, "dims", ())]
+    if precip_missing:
+        _raise_ctx(
+            ValueError,
+            f"precip_data missing required dimensions {precip_missing}; "
+            f"need {_required_dims}",
+        )
     
     # Process GRACE solutions
     grace_processed = []
@@ -698,7 +735,7 @@ def analyze_grace_response_by_pixel(
             raise ValueError(f"No aquifers found with IDs: {aquifer_ids}")
         # Use filtered aquifer geometry as aoi_geometry
         aoi_geometry = aquifer_gdf_filtered.geometry
-        print(f"Filtered to {len(aquifer_gdf_filtered)} aquifer(s) with IDs: {aquifer_ids}")
+        _note(f"filtered to {len(aquifer_gdf_filtered)} aquifer(s) with IDs: {aquifer_ids}")
     
     # Clip to AOI if provided (simplified for GeoSeries/GeoDataFrame)
     if aoi_geometry is not None:
@@ -737,9 +774,31 @@ def analyze_grace_response_by_pixel(
     
     # Align time dimensions
     grace_mean_ref, precip_coarsened = xr.align(grace_mean_ref, precip_coarsened, join='inner')
+    if len(grace_mean_ref.time) == 0:
+        _raise_ctx(
+            ValueError,
+            "No overlapping time between GRACE solutions and precipitation "
+            "after alignment and year exclusion",
+        )
     
     # Get aligned times (calculate once, reuse for all pixels)
     common_time_idx = pd.to_datetime(precip_coarsened.time.values)
+    n_cpus = os.cpu_count() or 1
+    if n_jobs is None or int(n_jobs) < 0:
+        # Prefer get_resource_config clamp so joblib does not oversubscribe with Dask.
+        try:
+            from download_data import get_resource_config
+
+            effective_jobs = int(get_resource_config().get("dask_workers") or max(1, n_cpus - 1))
+        except Exception:
+            effective_jobs = max(1, n_cpus - 1)
+        n_jobs = effective_jobs
+    else:
+        effective_jobs = int(n_jobs)
+    _announce(
+        f"pixel EPE analysis: decompose_grace={bool(decompose_grace)}  "
+        f"n_jobs={effective_jobs}  (index-based residual if decompose_grace=True)"
+    )
     
     # Initialize output arrays
     total_precip_array = np.zeros(grace_mean_ref.shape[1:])
@@ -827,24 +886,52 @@ def analyze_grace_response_by_pixel(
     
     # Calculate reference mean/std arrays
     grace_mean_ref_array = grace_mean_ref.values
-    grace_std_ref_array = grace_stack_ref.std(dim='solution', ddof=1).values
-    
+    # ddof=1 needs >=2 finite solutions; sparse NaNs at some (time,lat,lon) are harmless NaN std
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Degrees of freedom <= 0 for slice",
+            category=RuntimeWarning,
+        )
+        grace_std_ref_array = grace_stack_ref.std(dim='solution', ddof=1).values
+
     grace_mean_da = xr.DataArray(
         grace_mean_ref_array,
         dims=grace_mean_ref.dims,
         coords=grace_mean_ref.coords,
         name='grace_mean_reference'
     )
-    
+
     grace_std_da = xr.DataArray(
         grace_std_ref_array,
         dims=grace_mean_ref.dims,
         coords=grace_mean_ref.coords,
         name='grace_std_reference'
     )
-    
+
     events_df = pd.DataFrame(all_events_data)
-    
+    if events_df.empty or 'diff_mean' not in events_df.columns:
+        n_events_analyzed = 0
+        n_above_threshold = 0
+        n_valid_events = 0
+    else:
+        analyzed_mask = np.isfinite(events_df['diff_mean'].to_numpy(dtype=float))
+        n_events_analyzed = int(analyzed_mask.sum())
+        n_above_threshold = int(
+            (analyzed_mask & (events_df['diff_mean'].to_numpy(dtype=float) > float(grace_threshold))).sum()
+        )
+        if 'is_valid' in events_df.columns:
+            n_valid_events = int(events_df['is_valid'].fillna(False).astype(bool).sum())
+        else:
+            n_valid_events = 0
+    n_pixels_with_valid = int(np.count_nonzero(valid_response_array > 0))
+    _announce(
+        f"pixel EPE analysis done: {n_events_analyzed} events analyzed; "
+        f"{n_above_threshold} above {float(grace_threshold):g} cm; "
+        f"{n_valid_events} valid (> threshold and > inter-solution σ)  "
+        f"[{n_pixels_with_valid}/{n_valid_pixels} pixels with valid response]"
+    )
+
     return {
         'total_precip': total_precip_da,
         'valid_response_sum': valid_response_da,
@@ -946,12 +1033,17 @@ def analyze_grace_response_by_aquifer_pixel(
     if aquifer_ids is not None:
         aquifer_gdf = aquifer_gdf[aquifer_gdf[id_col].isin(aquifer_ids)].copy()
         if len(aquifer_gdf) == 0:
-            print(f"Warning: No aquifers found with IDs: {aquifer_ids}")
+            _note(
+                f"No aquifers found with IDs {aquifer_ids} "
+                f"(column {id_col!r}); returning empty results"
+            )
             return {}, pd.DataFrame()
-        print(f"Processing {len(aquifer_gdf)} aquifer(s) from filtered list: {aquifer_ids}")
+        _note(f"Processing {len(aquifer_gdf)} aquifer(s) from filtered list: {aquifer_ids}")
     
     aquifer_results = {}
     all_relationship_data = []
+    n_skipped = 0
+    skipped_examples = []
     
     # Process each aquifer
     for row in tqdm(aquifer_gdf.itertuples(), total=len(aquifer_gdf), desc="Processing aquifers"):
@@ -989,11 +1081,15 @@ def analyze_grace_response_by_aquifer_pixel(
             events_df = pixel_results.get('events_dataframe', pd.DataFrame())
             
             if events_df.empty or 'is_valid' not in events_df.columns:
+                n_skipped += 1
+                skipped_examples.append(aquifer_id)
                 continue
             
             valid_events_df = events_df[events_df['is_valid'] == True].copy()
             
             if len(valid_events_df) < 2:
+                n_skipped += 1
+                skipped_examples.append(aquifer_id)
                 continue
             
             if pixel_sum:
@@ -1080,13 +1176,27 @@ def analyze_grace_response_by_aquifer_pixel(
             # If one_plot=True, skip individual plots (will create combined plot after loop)
             
         except Exception as e:
-            print(f"[Aquifer {aquifer_id} ({aquifer_name})] Error: {e}")
+            n_skipped += 1
+            skipped_examples.append(aquifer_id)
+            _note(f"[Aquifer {aquifer_id} ({aquifer_name})] Error: {e}")
             continue
+
+    _summarize_skipped(
+        "aquifers (no/insufficient valid events or error)",
+        n_skipped,
+        len(aquifer_gdf),
+        examples=skipped_examples,
+    )
     
     if all_relationship_data:
         relationship_df = pd.concat(all_relationship_data, ignore_index=True)
     else:
         relationship_df = pd.DataFrame()
+        if len(aquifer_gdf) > 0 and len(aquifer_results) == 0:
+            _note(
+                "analyze_grace_response_by_aquifer_pixel: no aquifer produced "
+                "relationship data (need >=2 valid events per aquifer)"
+            )
     
     # Create combined plot if one_plot=True
     if one_plot and len(aquifer_results) > 0:
@@ -1260,7 +1370,7 @@ def _efficiency_classify_bounds_and_labels(efficiency_max, n_classes, data_array
     tick_locs = []
     for i in range(n_classes - 1):
         lo, hi = inner_bounds[i], inner_bounds[i + 1]
-        labels.append(f"{lo:g}–{hi:g}")
+        labels.append(f"{lo:g}-{hi:g}")
         tick_locs.append((lo + hi) / 2.0)
     labels.append(f">{emax:g}")
     tick_locs.append((inner_bounds[-1] + overflow_upper) / 2.0)
@@ -1374,6 +1484,40 @@ def _prepare_pixel_analysis_arrays(pixel_results, aoi_geometry=None):
     }
 
 
+def summarize_arid_response_coverage(pixel_results, aoi_geometry):
+    """
+    Share of arid-AOI GRACE cells with a detectable valid GRACE response.
+
+    Denominator = all GRACE grid cells inside the arid AOI polygon (rasterized),
+    including cells with zero EPE / zero response. Numerator = cells with
+    ``valid_response_sum > 0``.
+
+    Parameters
+    ----------
+    pixel_results : dict
+        Output of ``analyze_grace_response_by_pixel``.
+    aoi_geometry : GeoSeries, GeoDataFrame, or shapely geometry
+        Arid-region boundary used to mask the GRACE grid.
+
+    Returns
+    -------
+    dict
+        ``n_resp``, ``n_tot``, ``pct`` (rounded percent).
+    """
+    if aoi_geometry is None:
+        raise ValueError("aoi_geometry is required for arid-boundary coverage.")
+
+    arrays = _prepare_pixel_analysis_arrays(pixel_results, aoi_geometry)
+    vr = np.asarray(arrays["valid_response"].values, dtype=float)
+    n_tot = int(np.isfinite(vr).sum())
+    n_resp = int(np.nansum(vr > 0))
+    pct = int(round(100.0 * n_resp / n_tot)) if n_tot else 0
+    _announce(
+        f"{pct}% of arid GRACE pixels show a detectable response ({n_resp}/{n_tot})"
+    )
+    return {"n_resp": n_resp, "n_tot": n_tot, "pct": pct}
+
+
 def _build_pixel_analysis_catalog(
     total_precip,
     valid_response,
@@ -1408,6 +1552,10 @@ def _build_pixel_analysis_catalog(
     ]
     df = df.dropna(subset=main_cols, how='all').copy()
     if df.empty:
+        _note(
+            "pixel analysis catalog empty after dropping all-NaN rows "
+            "(check pixel_results totals / AOI mask)"
+        )
         return df
 
     lat_vals = np.asarray(tp.lat.values, dtype=float)
@@ -1449,7 +1597,11 @@ def _lake_std_categories(min_pct=20.0):
     """
     lo = float(min_pct)
     bounds = (lo, _LAKE_STD_MID, _LAKE_STD_HIGH)
-    labels = (f"{lo:g}–{_LAKE_STD_MID:g}%", f"{_LAKE_STD_MID:g}–{_LAKE_STD_HIGH:g}%", f">{_LAKE_STD_HIGH:g}%")
+    labels = (
+        f"{lo:g}-{_LAKE_STD_MID:g}%",
+        f"{_LAKE_STD_MID:g}-{_LAKE_STD_HIGH:g}%",
+        f">{_LAKE_STD_HIGH:g}%",
+    )
     return bounds, _LAKE_STD_COLORS, labels
 
 
@@ -1499,6 +1651,262 @@ def _prepare_lake_std_points(lake_points, value_col="std_pct_gr", min_pct=20.0):
     gdf = gdf.assign(_lake_cat=cat)
     gdf = gdf[gdf["_lake_cat"] >= 0]
     return gdf.reset_index(drop=True)
+
+
+def build_pixel_analysis_catalog(
+    pixel_results,
+    aoi_geometry=None,
+    *,
+    require_positive_re: bool = False,
+) -> pd.DataFrame:
+    """
+    Build a long-form per-pixel catalog from ``analyze_grace_response_by_pixel`` output.
+
+    Columns include lat/lon, cumulative EPE/response/uncertainty, and
+    ``recharge_efficiency_pct``. When ``require_positive_re=True``, keep only
+    pixels with finite RE > 0 (same validity used for the RE map).
+    """
+    arrays = _prepare_pixel_analysis_arrays(pixel_results, aoi_geometry)
+    catalog = _build_pixel_analysis_catalog(
+        arrays["total_precip"],
+        arrays["valid_response"],
+        arrays["valid_std"],
+        arrays["uncertainty_relative_pct"],
+        recharge_efficiency=arrays["recharge_efficiency"],
+    )
+    if catalog.empty:
+        _note(
+            "build_pixel_analysis_catalog: no valid pixels "
+            "(relax AOI / require_positive_re, or check analysis outputs)"
+        )
+        return catalog
+    if require_positive_re and "recharge_efficiency_pct" in catalog.columns:
+        re = pd.to_numeric(catalog["recharge_efficiency_pct"], errors="coerce")
+        catalog = catalog[np.isfinite(re) & (re > 0)].copy()
+        if catalog.empty:
+            _note(
+                "build_pixel_analysis_catalog: empty after require_positive_re "
+                "(no pixels with finite recharge efficiency > 0)"
+            )
+    return catalog.reset_index(drop=True)
+
+
+def join_lake_points_to_recharge_catalog(
+    lake_points: Union[str, Path, gpd.GeoDataFrame],
+    pixel_results=None,
+    *,
+    pixel_catalog: Optional[pd.DataFrame] = None,
+    aoi_geometry=None,
+    lake_value_col: str = "std_pct_gr",
+    lake_min_pct: float = 20.0,
+    coord_decimals: int = 1,
+) -> Tuple[gpd.GeoDataFrame, Dict[str, int]]:
+    """
+    Join notebook-02 SWS lake/pixel points to valid RE analysis pixels.
+
+    Matching uses rounded GRACE cell centers (``grace_lat``/``grace_lon`` or
+    point geometry vs catalog ``lat``/``lon``). Only pixels with finite
+    recharge efficiency > 0 are kept (Fig S11 / Table S3 population).
+
+    Returns
+    -------
+    joined : GeoDataFrame
+        Lake attributes plus RE fields.
+    counts : dict
+        ``n_sws``, ``n_on_re``, ``n_dropped``.
+    """
+    lakes = _prepare_lake_std_points(
+        lake_points, value_col=lake_value_col, min_pct=lake_min_pct
+    )
+    if lakes is None or lakes.empty:
+        raise ValueError("No lake points available after std-ratio filter")
+
+    n_sws = int(len(lakes))
+    if pixel_catalog is None:
+        if pixel_results is None:
+            raise ValueError("Provide pixel_results or pixel_catalog")
+        pixel_catalog = build_pixel_analysis_catalog(
+            pixel_results, aoi_geometry=aoi_geometry, require_positive_re=True
+        )
+    else:
+        pixel_catalog = pixel_catalog.copy()
+        if "recharge_efficiency_pct" in pixel_catalog.columns:
+            re = pd.to_numeric(pixel_catalog["recharge_efficiency_pct"], errors="coerce")
+            pixel_catalog = pixel_catalog[np.isfinite(re) & (re > 0)].copy()
+
+    if pixel_catalog.empty:
+        raise ValueError("RE pixel catalog is empty after validity filter")
+
+    lakes = lakes.copy()
+    if "grace_lat" in lakes.columns and "grace_lon" in lakes.columns:
+        lakes["_join_lat"] = pd.to_numeric(lakes["grace_lat"], errors="coerce")
+        lakes["_join_lon"] = pd.to_numeric(lakes["grace_lon"], errors="coerce")
+    else:
+        lakes["_join_lat"] = lakes.geometry.y
+        lakes["_join_lon"] = lakes.geometry.x
+
+    lakes["_k_lat"] = lakes["_join_lat"].round(coord_decimals)
+    lakes["_k_lon"] = lakes["_join_lon"].round(coord_decimals)
+
+    cat = pixel_catalog.copy()
+    cat["_k_lat"] = pd.to_numeric(cat["lat"], errors="coerce").round(coord_decimals)
+    cat["_k_lon"] = pd.to_numeric(cat["lon"], errors="coerce").round(coord_decimals)
+
+    re_cols = [
+        c
+        for c in (
+            "cumulative_epe_cm",
+            "cumulative_grace_cm",
+            "cumulative_uncertainty_cm",
+            "uncertainty_relative_pct",
+            "recharge_efficiency_pct",
+            "cell_id",
+        )
+        if c in cat.columns
+    ]
+    cat_join = cat[["_k_lat", "_k_lon"] + re_cols].drop_duplicates(
+        subset=["_k_lat", "_k_lon"], keep="first"
+    )
+
+    joined = lakes.merge(cat_join, on=["_k_lat", "_k_lon"], how="inner")
+    n_on_re = int(len(joined))
+    counts = {
+        "n_sws": n_sws,
+        "n_on_re": n_on_re,
+        "n_dropped": int(n_sws - n_on_re),
+    }
+    _announce(
+        f"Fig S11 / Table S3: {n_on_re} of {n_sws} SWS pixels on valid RE "
+        f"(dropped {counts['n_dropped']})"
+    )
+    joined = joined.drop(
+        columns=[c for c in ("_join_lat", "_join_lon", "_k_lat", "_k_lon") if c in joined.columns],
+        errors="ignore",
+    )
+    return joined.reset_index(drop=True), counts
+
+
+_TABLE_S3_RENAME = {
+    "grace_lat": "GRACE pixel latitude (deg)",
+    "grace_lon": "GRACE pixel longitude (deg)",
+    "n_lakes": "Number of lakes in pixel",
+    "lake_ids": "HydroLAKES IDs",
+    "lake_names": "Lake names",
+    "lake_id": "HydroLAKES ID",
+    "lake_name": "Lake name",
+    "country": "Country",
+    "area_km2": "Total lake area (km2)",
+    "completeness_pct": "Lake record completeness (%)",
+    "complete": "Lake record completeness (%)",
+    "std_pct_gr": "Lake std as % of GRACE std",
+    "lake_std_pct_of_grace": "Lake std as % of GRACE std",
+    "lake_std_cm": "Lake storage std (cm WE)",
+    "grace_std_cm": "GRACE TWSA std (cm WE)",
+    "std_cm_res": "Residual lake storage std (cm WE)",
+    "gstd_cm_re": "Residual GRACE TWSA std (cm WE)",
+    "std_pct_re": "Residual lake std as % of GRACE",
+    "lake_std_pct_of_grace_residual": "Residual lake std as % of GRACE",
+    "lake_std_cm_residual": "Residual lake storage std (cm WE)",
+    "grace_std_cm_residual": "Residual GRACE TWSA std (cm WE)",
+    "ltrend_cm": "Lake trend (cm/yr)",
+    "gtrend_cm": "GRACE trend (cm/yr)",
+    "lake_trend_cm_yr": "Lake trend (cm/yr)",
+    "grace_trend_cm_yr": "GRACE trend (cm/yr)",
+    "n_months": "Overlap months",
+    "n_overlap_months": "Overlap months",
+    "window_deg": "GRACE window (deg)",
+    "grace_km2": "GRACE window area (km2)",
+    "grace_window_area_km2": "GRACE window area (km2)",
+    "dist_deg": "Distance to GRACE cell (deg)",
+    "haversine_distance_deg": "Distance to GRACE cell (deg)",
+    "cumulative_epe_cm": "Cumulative EPE precipitation (cm)",
+    "cumulative_grace_cm": "Cumulative GRACE residual response (cm)",
+    "cumulative_uncertainty_cm": "Cumulative uncertainty (cm)",
+    "uncertainty_relative_pct": "Relative uncertainty (% of response)",
+    "recharge_efficiency_pct": "Recharge efficiency (%)",
+    "cell_id": "RE cell ID",
+}
+
+_TABLE_S3_DROP = {
+    "geometry",
+    "_lake_cat",
+    "_ratio",
+    "plot_lat",
+    "plot_lon",
+    "record_type",
+    "grid_assignment",
+    "lat",
+    "lon",
+    "i",
+    "j",
+}
+
+
+def _excel_force_text_cell(value) -> str:
+    """
+    Format a CSV cell so Excel treats it as text (not a number).
+
+    Comma-separated HydroLAKES IDs are otherwise parsed as one huge number and
+    truncated past ~15 digits (trailing zeros). The ``="..."`` form displays the
+    original string in Excel while remaining readable in text editors.
+    """
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        return ""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.startswith('="') and text.endswith('"'):
+        return text
+    return f'="{text.replace(chr(34), chr(34)+chr(34))}"'
+
+
+def export_table_s3_lake_recharge(
+    joined_gdf: Union[pd.DataFrame, gpd.GeoDataFrame],
+    save_path: Union[str, Path],
+) -> pd.DataFrame:
+    """
+    Clean and write Table S3 (SWS lakes on valid RE pixels) as UTF-8 CSV.
+
+    Expects the GeoDataFrame/DataFrame from
+    ``join_lake_points_to_recharge_catalog``.
+
+    HydroLAKES ID columns are written Excel-safe (``="..."``) so comma-separated
+    ID lists are not coerced to truncated numbers when opened in Excel.
+    """
+    df = pd.DataFrame(joined_gdf).copy()
+    df = df.drop(columns=[c for c in _TABLE_S3_DROP if c in df.columns], errors="ignore")
+
+    ordered = [c for c in _TABLE_S3_RENAME if c in df.columns]
+    leftovers = [c for c in df.columns if c not in ordered]
+    df = df[ordered + leftovers]
+    df = df.rename(columns={k: v for k, v in _TABLE_S3_RENAME.items() if k in df.columns})
+
+    for col in df.columns:
+        if any(tok in col.lower() for tok in ("latitude", "longitude")):
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(3)
+        elif "area (km2)" in col.lower():
+            df[col] = pd.to_numeric(df[col], errors="coerce").round(1)
+        elif any(
+            tok in col.lower()
+            for tok in ("std", "%", "trend", "completeness", "epe", "response", "uncertainty", "efficiency")
+        ):
+            num = pd.to_numeric(df[col], errors="coerce")
+            if num.notna().any():
+                df[col] = num.round(2)
+
+    # Force HydroLAKES ID fields to text for Excel (comma-separated lists).
+    for col in df.columns:
+        if "hydrolakes id" in col.lower():
+            df[col] = df[col].map(_excel_force_text_cell)
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    # utf-8-sig helps Excel recognize UTF-8 (lake names); IDs use ="..." above.
+    df.to_csv(save_path, index=False, encoding="utf-8-sig")
+    _item(_rel(save_path), "ok")
+    return df.reset_index(drop=True)
 
 
 def plot_pixel_analysis_maps(
@@ -1707,25 +2115,22 @@ def plot_pixel_analysis_maps(
     if return_pixel_catalog:
         pixel_counts['pixel_catalog'] = pixel_catalog
     _count_labels = {
-        'epe': 'Cumulative EPE',
+        'epe': 'EPE',
         'grace': 'GRACE response',
-        'efficiency': 'Recharge efficiency',
-        'uncertainty': unc_title,
+        'efficiency': 'RE',
+        'uncertainty': 'uncertainty',
     }
-    print("plot_pixel_analysis_maps — plottable pixel counts (finite, > 0 after mask):")
-    for kind in ('epe', 'grace', 'efficiency', 'uncertainty'):
-        print(f"  {_count_labels[kind]}: n={pixel_counts[kind]}")
-    if return_pixel_catalog:
-        print(f"  pixel_catalog rows (AOI, any finite metric): n={len(pixel_catalog)}")
     plotted_kinds = [s['kind'] for s in plot_specs]
-    print(f"  panels in layout={layout!r}: {', '.join(plotted_kinds)}")
+    count_bits = [
+        f"{_count_labels[kind]}={pixel_counts[kind]}" for kind in plotted_kinds
+    ]
+    _announce(f"pixel maps: {'; '.join(count_bits)}")
 
     if efficiency_classify and layout == 'efficiency':
         class_df = _efficiency_class_counts(
             recharge_efficiency.values, efficiency_max, efficiency_n_classes
         )
         pixel_counts['efficiency_by_class'] = class_df
-        print("  Recharge efficiency by class:")
         print(
             class_df[["class", "label", "n_pixels", "pct"]]
             .to_string(index=False, float_format=lambda x: f"{x:.2f}")
@@ -2012,18 +2417,32 @@ def plot_pixel_analysis_maps(
         gl.xlabel_style = {'rotation': 0, 'size': _MAP_GRID_LABEL_FONTSIZE}
         gl.ylabel_style = {'rotation': 90, 'size': _MAP_GRID_LABEL_FONTSIZE}
     
-    plt.tight_layout(pad=_MAP_TIGHT_LAYOUT_PAD)
-    
+    # Cartopy GeoAxes are not fully supported by tight_layout; spacing still OK with
+    # savefig(bbox_inches='tight'). Filter the known UserWarning.
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="This figure includes Axes that are not compatible with tight_layout",
+            category=UserWarning,
+        )
+        plt.tight_layout(pad=_MAP_TIGHT_LAYOUT_PAD)
+
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(save_path, dpi=500, bbox_inches='tight')
-        print(f"Map saved to: {save_path}")
+        _item(_rel(save_path), "ok")
 
     if save_raster:
         from grace_analysis_utils import (
             _compose_raster_output_path,
             _export_geotiff_dataarray,
         )
+
+        # Continuous panel values (not display class IDs). Resolve relative dirs
+        # against the repo root so cwd=notebooks/ does not write notebooks/outputs/.
+        raster_dir = Path(saved_rasters_path)
+        if not raster_dir.is_absolute():
+            raster_dir = Path(__file__).resolve().parent.parent / raster_dir
 
         raster_stems = {
             "epe": "pixel_cumulative_epe_cm",
@@ -2035,21 +2454,13 @@ def plot_pixel_analysis_maps(
                 else "pixel_uncertainty_cm"
             ),
         }
-        base_tags = list(raster_tags or []) + [f"layout_{layout}"]
-        if efficiency_classify:
-            base_tags.extend(
-                [
-                    "classified",
-                    f"nclasses_{int(efficiency_n_classes)}",
-                    f"effmax_{int(efficiency_max)}",
-                ]
-            )
+        base_tags = list(raster_tags or [])
         saved_raster_paths = []
         for spec in plot_specs:
             kind = spec["kind"]
             stem = raster_stems[kind]
             out_path = _compose_raster_output_path(
-                saved_rasters_path, stem, base_tags
+                str(raster_dir), stem, base_tags
             )
             saved_raster_paths.append(
                 _export_geotiff_dataarray(spec["data"], out_path)
@@ -2099,6 +2510,17 @@ def _mask_pixel_results_by_geometry(pixel_results, geometry):
     }
 
 
+def _epe_values_to_cm(values, epe_input_unit="mm"):
+    """Convert EPE totals to cm; accepts mm/cm aliases used by scatter helpers."""
+    u = str(epe_input_unit).strip().lower()
+    arr = np.asarray(values, dtype=float)
+    if u in ("mm", "millimeter", "millimeters"):
+        return arr * 0.1
+    if u in ("cm", "centimeter", "centimeters"):
+        return arr
+    raise ValueError("epe_input_unit must be 'mm' or 'cm'")
+
+
 def _pixel_epe_grace_arrays_from_results(
     pixel_results,
     *,
@@ -2119,13 +2541,7 @@ def _pixel_epe_grace_arrays_from_results(
     y = rs.values.ravel().astype(float)
     s = su.values.ravel().astype(float)
 
-    u = str(epe_input_unit).strip().lower()
-    if u in ("mm", "millimeter", "millimeters"):
-        x = x_raw * 0.1
-    elif u in ("cm", "centimeter", "centimeters"):
-        x = x_raw
-    else:
-        raise ValueError("epe_input_unit must be 'mm' or 'cm'")
+    x = _epe_values_to_cm(x_raw, epe_input_unit)
 
     m = np.isfinite(x) & np.isfinite(y) & np.isfinite(s)
     m &= x > float(min_cumulative_epe_cm)
@@ -2150,6 +2566,11 @@ def _pixel_epe_grace_arrays_from_results(
         vmax_c = cap
     else:
         vmax_c = float(np.nanmax(pct)) if len(pct) else 1.0
+    if len(x) == 0:
+        _note(
+            "EPE–GRACE pixel arrays empty after filters "
+            "(check grace_threshold / EPE caps / finite mask)"
+        )
     return x, y, pct, vmax_c
 
 
@@ -2190,19 +2611,17 @@ def _pixel_epe_grace_arrays_from_events(
 ):
     """Filter valid event rows for EPE–GRACE scatter; returns x, y, pct, vmax_c."""
     if events_df is None or len(events_df) == 0:
+        _note(
+            "EPE–GRACE event arrays empty: no rows "
+            "(empty events_dataframe or none marked is_valid)"
+        )
         return np.array([]), np.array([]), np.array([]), 1.0
 
     x_raw = events_df["precip_sum"].values.astype(float)
     y = events_df["diff_mean"].values.astype(float)
     s = events_df["diff_std"].values.astype(float)
 
-    u = str(epe_input_unit).strip().lower()
-    if u in ("mm", "millimeter", "millimeters"):
-        x = x_raw * 0.1
-    elif u in ("cm", "centimeter", "centimeters"):
-        x = x_raw
-    else:
-        raise ValueError("epe_input_unit must be 'mm' or 'cm'")
+    x = _epe_values_to_cm(x_raw, epe_input_unit)
 
     m = np.isfinite(x) & np.isfinite(y) & np.isfinite(s)
     m &= x > float(min_cumulative_epe_cm)
@@ -2227,6 +2646,11 @@ def _pixel_epe_grace_arrays_from_events(
         vmax_c = cap
     else:
         vmax_c = float(np.nanmax(pct)) if len(pct) else 1.0
+    if len(x) == 0:
+        _note(
+            "EPE–GRACE event arrays empty after filters "
+            "(check is_valid / grace_threshold / EPE caps)"
+        )
     return x, y, pct, vmax_c
 
 
@@ -2249,6 +2673,10 @@ def _pixel_epe_grace_arrays(
 
     events_df = pixel_results.get("events_dataframe", pd.DataFrame())
     if events_df is None or len(events_df) == 0:
+        _note(
+            "EPE–GRACE event aggregation: events_dataframe empty or missing; "
+            "returning empty arrays"
+        )
         return np.array([]), np.array([]), np.array([]), 1.0
     if "is_valid" in events_df.columns:
         events_df = events_df.loc[events_df["is_valid"] == True].copy()
@@ -2312,9 +2740,10 @@ def plot_event_cluster_distribution_and_relationship(
         Filter: remove points with uncertainty above this value before plotting
         and fitting. ``None`` keeps all points.
     vmax_uncertainty_pct : float, optional
-        Colorbar cap: maximum color scale value. Points above this are clipped
-        to the cap color but still shown and used in the fit (unless also
-        removed by ``max_uncertainty_pct``). ``None`` auto-scales to data max.
+        Colorbar cap: scale is 0–vmax. Points with uncertainty above the cap are
+        still plotted (darkest color) and included in the fit; the colorbar uses
+        ``extend='max'`` so values above the cap are visible as out-of-range.
+        ``None`` auto-scales to data max (no extend).
 
     Returns
     -------
@@ -2335,13 +2764,7 @@ def plot_event_cluster_distribution_and_relationship(
     y = events_df["diff_mean"].values.astype(float)
     s = events_df["diff_std"].values.astype(float)
 
-    u = str(epe_input_unit).strip().lower()
-    if u in ("mm", "millimeter", "millimeters"):
-        x = x_raw * 0.1
-    elif u in ("cm", "centimeter", "centimeters"):
-        x = x_raw
-    else:
-        raise ValueError("epe_input_unit must be 'mm' or 'cm'")
+    x = _epe_values_to_cm(x_raw, epe_input_unit)
 
     finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(s)
     x, y, s = x[finite], y[finite], s[finite]
@@ -2398,7 +2821,10 @@ def plot_event_cluster_distribution_and_relationship(
     ax_hist.grid(axis="y", alpha=0.3)
     _panel_letter(ax_hist, "a")
 
-    norm = Normalize(vmin=0.0, vmax=max(vmax_c, 1e-9))
+    # Cap color scale at vmax_c; clip=True maps pct > vmax to the end color so
+    # high-uncertainty points stay visible (darkest). extend='max' marks ">vmax".
+    capped_scale = vmax_uncertainty_pct is not None
+    norm = Normalize(vmin=0.0, vmax=max(vmax_c, 1e-9), clip=True)
     sc = ax_scatter.scatter(
         x,
         y,
@@ -2443,7 +2869,12 @@ def plot_event_cluster_distribution_and_relationship(
     ax_scatter.grid(True, alpha=0.3)
     _panel_letter(ax_scatter, "b")
 
-    cbar = fig.colorbar(sc, ax=ax_scatter, pad=0.02)
+    cbar = fig.colorbar(
+        sc,
+        ax=ax_scatter,
+        pad=0.02,
+        extend="max" if capped_scale else "neither",
+    )
     cbar.set_label("Uncertainty (%)")
     cbar.set_ticks(_uncertainty_pct_cbar_ticks(vmax_c))
 
@@ -2486,6 +2917,7 @@ def _draw_pixel_epe_grace_on_ax(
     title=None,
     domain_label=None,
     domain_label_align="center",
+    domain_label_fontsize=9,
     xlabel="Cumulative EPEs (cm)",
     ylabel="Cumulative GRACE Response (cm)",
     cmap="viridis_r",
@@ -2516,7 +2948,7 @@ def _draw_pixel_epe_grace_on_ax(
             transform=axis.transAxes,
             ha=ha,
             va="top",
-            fontsize=9,
+            fontsize=float(domain_label_fontsize),
             fontweight="bold",
             zorder=10,
             bbox={
@@ -2529,6 +2961,9 @@ def _draw_pixel_epe_grace_on_ax(
         )
 
     if len(x) < 1:
+        _note(
+            f"{empty_msg} — check filters (grace_threshold, EPE caps, domain mask)"
+        )
         ax.text(
             0.5,
             0.5,
@@ -3147,6 +3582,154 @@ def plot_pixel_epe_grace_relationship(
     return figs, axes_list, stats_df
 
 
+def plot_epe_grace_agg_uncertainty_collage(
+    pixel_results,
+    *,
+    aggregations=("pixel", "event", "pixel", "event"),
+    vmax_uncertainty_pcts=(50, 50, 20, 20),
+    panel_labels=("a", "b", "c", "d"),
+    grace_threshold=1.5,
+    min_cumulative_epe_cm=0.0,
+    max_cumulative_epe_cm=None,
+    max_cumulative_grace_cm=None,
+    min_abs_response_cm=None,
+    epe_input_unit="cm",
+    model="linear",
+    cmap="viridis_r",
+    cbar_label="Uncertainty (%)",
+    panel_figsize=(7.0, 6.0),
+    dpi=150,
+    save_path=None,
+):
+    """
+    Fig S8-style 2x2 collage: aggregation (pixel/event) x uncertainty cap.
+
+    Default panel order (row-major), matching the manuscript collage:
+
+    - **a** ``pixel``, vmax=50
+    - **b** ``event``, vmax=50
+    - **c** ``pixel``, vmax=20
+    - **d** ``event``, vmax=20
+
+    Each row has its own uncertainty colorbar (scale = that row's vmax).
+    ``vmax`` also filters points to ``uncertainty_pct <= vmax``, same as
+    ``plot_pixel_epe_grace_relationship``.
+
+    Returns
+    -------
+    fig, axes, stats_df
+        ``axes`` is a (2, 2) object array; ``stats_df`` has columns
+        ``panel``, ``aggregation``, ``vmax_uncertainty_pct``, plus fit stats.
+    """
+    from matplotlib.colors import Normalize
+    from matplotlib.gridspec import GridSpec
+    from matplotlib.cm import ScalarMappable
+    from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+    aggs = tuple(aggregations)
+    vmxs = tuple(float(v) for v in vmax_uncertainty_pcts)
+    labels = tuple(panel_labels)
+    n = len(aggs)
+    if not (n == len(vmxs) == len(labels) == 4):
+        raise ValueError(
+            "aggregations, vmax_uncertainty_pcts, and panel_labels must each have length 4"
+        )
+    if str(model).strip().lower() != "linear":
+        raise ValueError("plot_epe_grace_agg_uncertainty_collage requires model='linear'")
+
+    nrows, ncols = 2, 2
+    fw = float(panel_figsize[0]) * ncols * 1.04
+    fh = float(panel_figsize[1]) * nrows
+    fig = plt.figure(figsize=(fw, fh), dpi=dpi)
+    gs = GridSpec(nrows, ncols, figure=fig, wspace=0.16, hspace=0.18)
+
+    axes = np.empty((nrows, ncols), dtype=object)
+    stats_rows = []
+    filter_base = dict(
+        epe_input_unit=epe_input_unit,
+        grace_threshold=grace_threshold,
+        min_cumulative_epe_cm=min_cumulative_epe_cm,
+        max_cumulative_epe_cm=max_cumulative_epe_cm,
+        max_cumulative_grace_cm=max_cumulative_grace_cm,
+        min_abs_response_cm=min_abs_response_cm,
+    )
+
+    for i, (agg, vmax_c, letter) in enumerate(zip(aggs, vmxs, labels)):
+        row, col = divmod(i, ncols)
+        ax = fig.add_subplot(gs[row, col])
+        axes[row, col] = ax
+
+        agg_l = str(agg).strip().lower()
+        if agg_l == "event":
+            xlabel, ylabel = "EPE (cm)", "GRACE Response (cm)"
+        elif agg_l == "pixel":
+            xlabel, ylabel = "Cumulative EPEs (cm)", "Cumulative GRACE Response (cm)"
+        else:
+            raise ValueError("aggregation must be 'pixel' or 'event'")
+
+        x, y, pct, vmax_used = _pixel_epe_grace_arrays(
+            pixel_results,
+            aggregation=agg_l,
+            geometry=None,
+            vmax_uncertainty_pct=vmax_c,
+            **filter_base,
+        )
+
+        sc, stats_df = _draw_pixel_epe_grace_on_ax(
+            ax,
+            x,
+            y,
+            pct,
+            vmax_used,
+            model=model,
+            domain_label=str(letter),
+            domain_label_align="center",
+            domain_label_fontsize=14,
+            xlabel=xlabel,
+            ylabel=ylabel,
+            cmap=cmap,
+            show_xlabel=(row == nrows - 1),
+            show_ylabel=True,
+        )
+        if stats_df is not None:
+            row_df = stats_df.copy()
+            row_df.insert(0, "panel", str(letter))
+            row_df.insert(1, "aggregation", agg_l)
+            row_df.insert(2, "vmax_uncertainty_pct", float(vmax_c))
+            stats_rows.append(row_df)
+
+    # One colorbar per row; scale matches that row's vmax (panels share vmax within a row).
+    for row in range(nrows):
+        vmax_row = float(vmxs[row * ncols])
+        right_ax = axes[row, ncols - 1]
+        sm = ScalarMappable(
+            norm=Normalize(vmin=0.0, vmax=max(vmax_row, 1e-9)),
+            cmap=cmap,
+        )
+        sm.set_array([])
+        divider = make_axes_locatable(right_ax)
+        cax = divider.append_axes("right", size="3.5%", pad=0.04)
+        cbar = fig.colorbar(sm, cax=cax)
+        cbar.set_label(cbar_label)
+        cbar.set_ticks(_uncertainty_pct_cbar_ticks(vmax_row))
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="This figure includes Axes that are not compatible with tight_layout",
+            category=UserWarning,
+        )
+        fig.tight_layout(pad=0.12, w_pad=0.10, h_pad=0.08)
+
+    if save_path:
+        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight", dpi=dpi)
+        _item(_rel(save_path), "ok")
+
+    plt.show()
+    stats_out = pd.concat(stats_rows, ignore_index=True) if stats_rows else None
+    return fig, axes, stats_out
+
 
 def _diag_closest_nice_bin_width(w_raw):
     """Pick closest 'nice' bin width to w_raw from (1, 2, 2.5, 4, 5, 10) × 10^k."""
@@ -3283,8 +3866,9 @@ def plot_pixel_results_distribution_diagnostics(
 
     - **Cumulative EPE**: ``total_precip`` (**cm**).
     - **GRACE response**: ``valid_response_sum`` (**cm**).
-    - **Uncertainty**: ``relative_pct`` — ``(valid_std / valid_response) * 100`` where both
-      > 0; or ``absolute`` — ``valid_std_sum`` (**cm**).
+    - **Uncertainty**: ``relative_pct`` — ``(valid_std / valid_response) * 100`` where
+      response > 0 (same as ``plot_pixel_analysis_maps``; ``std == 0`` yields 0%);
+      or ``absolute`` — ``valid_std_sum`` (**cm**).
     - **Efficiency**: ``(valid_response / total_precip) * 100`` where ``total_precip > 0``
       with both GRACE and EPE in **cm** (same formula as maps when inputs share that convention).
 
@@ -3325,10 +3909,10 @@ def plot_pixel_results_distribution_diagnostics(
     Notes
     -----
     The number of finite values, mean, and median for each panel are printed to stdout
-    as one summary table (after plotting). For ``uncertainty_mode='relative_pct'``, the
-    uncertainty panel can have a **smaller** ``n`` than EPE/GRACE/efficiency because relative
-    uncertainty is only defined where ``valid_std_sum > 0`` and GRACE response is positive;
-    pixels with zero or missing cross-solution spread are omitted from that histogram only.
+    as one summary table (after plotting). With ``min_grace_response_cm`` set, EPE/GRACE/
+    efficiency/uncertainty share the same response filter, so their ``n`` match
+    ``plot_pixel_analysis_maps`` GRACE/uncertainty counts for that threshold (maps without
+    the threshold still show a larger EPE ``n``).
     """
     from matplotlib.lines import Line2D
 
@@ -3361,8 +3945,10 @@ def plot_pixel_results_distribution_diagnostics(
         std_cm = np.where(bad, nan, std_cm)
 
     if umode == "relative_pct":
+        # Match plot_pixel_analysis_maps / _prepare_pixel_analysis_arrays:
+        # (std / response) * 100 wherever response > 0 (std == 0 -> 0%).
         unc = np.full_like(grace_cm, np.nan, dtype=float)
-        m_u = (grace_cm > 0) & (std_cm > 0) & np.isfinite(grace_cm) & np.isfinite(std_cm)
+        m_u = (grace_cm > 0) & np.isfinite(grace_cm) & np.isfinite(std_cm)
         unc[m_u] = (std_cm[m_u] / grace_cm[m_u]) * 100.0
         unc_title = "Uncertainty (% of response)"
         unc_xlabel = "Uncertainty (%)"
@@ -3518,7 +4104,7 @@ def plot_pixel_results_distribution_diagnostics(
     summary = pd.DataFrame(summary_rows)
     stats_df = pd.DataFrame(stats_rows)
     _fmt = lambda v: "nan" if v is None or (isinstance(v, float) and not np.isfinite(v)) else f"{v:.6g}"
-    print("plot_pixel_results_distribution_diagnostics — distribution summary:")
+    print("plot_pixel_results_distribution_diagnostics: distribution summary:")
     print(
         stats_df.to_string(
             index=False,
